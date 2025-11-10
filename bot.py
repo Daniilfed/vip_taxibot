@@ -2,11 +2,14 @@ import os
 import csv
 import logging
 from datetime import datetime
+from uuid import uuid4
 
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
     KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
     BotCommand,
 )
 from telegram.ext import (
@@ -14,394 +17,478 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     ConversationHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
 
-# ========= НАСТРОЙКИ =========
-# Твой Telegram ID для уведомлений (можно переопределить переменной окружения ADMIN_CHAT_ID)
+# ======================== НАСТРОЙКИ =========================
+BRAND_NAME = "VIP taxi"
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "143710784"))
-
-# Токен бота
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 assert BOT_TOKEN, "BOT_TOKEN is required"
 
-# Настройки LLM (для перевода и NLU)
-MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL") or None
-LLM_API_KEY = os.getenv("LLM_API_KEY")
-LLM_ENABLED = False
-try:
-    if LLM_API_KEY:
-        from openai import OpenAI
-        client_kwargs = {}
-        if OPENAI_BASE_URL:
-            client_kwargs["base_url"] = OPENAI_BASE_URL
-        client = OpenAI(api_key=LLM_API_KEY, **client_kwargs)
-        LLM_ENABLED = True
-except Exception:
-    LLM_ENABLED = False
+# Реальные фото (Unsplash, нейтральные, без водяных знаков)
+CAR_PHOTOS = {
+    "S-Class W222": "https://images.unsplash.com/photo-1615732045871-8db6d1dc8723",
+    "Maybach W222": "https://images.unsplash.com/photo-1624784194858-4e1cb2e54c56",
+    "S-Class W223": "https://images.unsplash.com/photo-1649254362283-5c9b83a3d31f",
+    "Maybach W223": "https://images.unsplash.com/photo-1650659020204-3d8e60d2dcbb",
+    "Business": "https://images.unsplash.com/photo-1606813902915-5c2b66f04e8e",  # E-Class / BMW 5
+    "Minivan": "https://images.unsplash.com/photo-1618401471383-5e00764f9a72",  # V-Class
+}
 
-# ========= ЛОГИ =========
+CAR_DESCR = {
+    "S-Class W222": "Mercedes-Benz S-Class (W222). Кожаный салон, салфетки, вода, зарядки.",
+    "Maybach W222": "Mercedes-Maybach (W222). Индивидуальные кресла, салфетки, вода, зарядки.",
+    "S-Class W223": "Mercedes-Benz S-Class (W223). Новое поколение; салфетки, вода, зарядки.",
+    "Maybach W223": "Mercedes-Maybach (W223). Флагман люкса: массаж, подсветка; вода и зарядки.",
+    "Business": "Mercedes E-Class / BMW 5. Комфортный седан, вода и зарядки.",
+    "Minivan": "Mercedes V-Class. До 6 пассажиров; салфетки, вода, зарядки; детское кресло по запросу.",
+}
+
+PRICES = {
+    "S-Class W222": "от 2000 ₽/ч",
+    "Maybach W222": "от 2600 ₽/ч",
+    "S-Class W223": "от 2300 ₽/ч",
+    "Maybach W223": "от 3000 ₽/ч",
+    "Business": "от 1200 ₽/ч",
+    "Minivan": "от 1500 ₽/ч",
+}
+
+# ======================== ЛОГИ =========================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("vip_taxi_bot")
 
-# ========= СОСТОЯНИЯ DIALOG =========
-PICKUP, DROP, CAR_CLASS, WHEN, CONTACT, CONFIRM = range(6)
-ORDER_SLOTS = ["pickup", "drop", "car_class", "when", "passengers", "contact"]
-
-# ========= УТИЛИТЫ =========
+# ======================== КЛАВИАТУРЫ =========================
 def main_menu():
-    """Кнопки-команды (не callback): шлют текст /order и /translate."""
     return ReplyKeyboardMarkup(
-        [[KeyboardButton("🛎 Заказ /order"), KeyboardButton("🌐 Перевод /translate")]],
+        [
+            [KeyboardButton("🛎 Заказ"), KeyboardButton("🚗 Автопарк")],
+            [KeyboardButton("💳 Оплата"), KeyboardButton("📞 Контакты")],
+            [KeyboardButton("⭐ Отзыв"), KeyboardButton("🪪 VIP-карта")],
+            [KeyboardButton("📍 Геолокация", request_location=True)],
+        ],
         resize_keyboard=True,
     )
 
-def normalize_car_class(text: str | None) -> str | None:
-    if not text:
-        return None
-    t = text.lower().strip()
-    if t in {"business", "бизнес"}:
-        return "Business"
-    if t in {"s", "s-класс", "s class", "s-класc"}:
-        return "S"
-    if t in {"minivan", "минивэн", "минивен"}:
-        return "Minivan"
-    return None
+def pickup_location_kb():
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("📍 Отправить мою геолокацию", request_location=True)]],
+        resize_keyboard=True, one_time_keyboard=True
+    )
 
-def ensure_orders_csv(path="orders.csv"):
+def car_choice_kb():
+    rows = [
+        [InlineKeyboardButton("S-Class W222", callback_data="car:S-Class W222"),
+         InlineKeyboardButton("Maybach W222", callback_data="car:Maybach W222")],
+        [InlineKeyboardButton("S-Class W223", callback_data="car:S-Class W223"),
+         InlineKeyboardButton("Maybach W223", callback_data="car:Maybach W223")],
+        [InlineKeyboardButton("Business", callback_data="car:Business"),
+         InlineKeyboardButton("Minivan", callback_data="car:Minivan")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+def pay_button(order_id: str, amount: int):
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(f"Оплатить {amount} ₽", callback_data=f"pay:{order_id}:{amount}")]]
+    )
+
+# ======================== СОСТОЯНИЯ =========================
+PICKUP, DROP, CAR_CLASS, WHEN, PASSENGERS, CONTACT, CONFIRM = range(7)
+
+# ======================== ХРАНИЛКА =========================
+def ensure_csv(path: str, header: list[str]):
     if not os.path.exists(path):
         with open(path, "w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(
-                ["ts", "user_id", "username", "pickup", "drop", "car_class", "when", "passengers", "contact"]
-            )
+            csv.writer(f).writerow(header)
 
-# ========= КОМАНДЫ =========
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "🚖 *VIP Taxi Assistant*\n"
-        "Привет! Помогу оформить заказ, перевести сообщение и ответить клиенту.\n\n"
-        "Нажмите кнопки снизу или введите команды:\n"
-        "• /order — оформить заказ\n"
-        "• /translate — перевод RU/EN\n"
-        "• /info — информация о сервисе\n"
-        "• /help — помощь\n"
-    )
-    await (update.message or update.callback_query.message).reply_text(
-        text, parse_mode="Markdown", reply_markup=main_menu()
-    )
+def save_order(o: dict, user):
+    ensure_csv("orders.csv", ["ts", "user_id", "username", "pickup", "drop", "car", "when", "passengers", "contact", "paid"])
+    with open("orders.csv", "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow([
+            datetime.utcnow().isoformat(), user.id, user.username,
+            o.get("pickup"), o.get("drop"), o.get("car"),
+            o.get("when"), o.get("passengers"), o.get("contact"),
+            o.get("paid", 0)
+        ])
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "🤖 *Команды:*\n"
-        "/start — приветствие и меню\n"
-        "/order — оформить заказ VIP-такси\n"
-        "/translate — перевод RU/EN (если нажали без текста, пришлите текст следом)\n"
-        "/info — информация и контакты\n"
-        "/cancel — отменить оформление заказа\n\n"
-        "Любое сообщение могу распознать как заказ (адреса/время/класс/пассажиры) и довести оформление до подтверждения."
-    )
-    await update.message.reply_text(text, parse_mode="Markdown")
+def save_feedback(rating: int, comment: str, user):
+    ensure_csv("feedback.csv", ["ts", "user_id", "username", "rating", "comment"])
+    with open("feedback.csv", "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow([datetime.utcnow().isoformat(), user.id, user.username, rating, comment])
 
-async def info_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "ℹ️ VIP Taxi Assistant\nПремиальные поездки (Mercedes S, Business, Minivan). "
-        "Вода, зарядка, Wi-Fi. Заказы 24/7 — начните с /order.",
-    )
-
-# ========= NLU (распознавание намерения и слотов) =========
-async def nlu_extract(text: str) -> dict:
-    """
-    Возвращает dict:
-    {
-      "intent": "order|translate|chitchat",
-      "pickup": "...", "drop": "...", "when": "...",
-      "car_class": "Business|S|Minivan",
-      "passengers": 1,
-      "contact": "..."
+def save_user_stat(user):
+    ensure_csv("users.csv", ["user_id", "username", "name", "orders", "last"])
+    rows = {}
+    if os.path.exists("users.csv"):
+        with open("users.csv", "r", encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                rows[int(r["user_id"])] = r
+    name = f"{user.first_name or ''} {user.last_name or ''}".strip()
+    if user.id in rows:
+        cnt = int(rows[user.id]["orders"]) + 1
+    else:
+        cnt = 1
+    rows[user.id] = {
+        "user_id": str(user.id),
+        "username": user.username or "",
+        "name": name,
+        "orders": str(cnt),
+        "last": datetime.utcnow().isoformat()
     }
-    """
-    # Без LLM — простая эвристика
-    if not LLM_ENABLED:
-        low = text.lower()
-        intent = "order" if any(k in low for k in
-                                ["заказ", "такси", "машина", "s-класс", "микроавтобус", "минивэн", "аэропорт", "шереметьево"]) \
-                 else ("translate" if "/translate" in low else "chitchat")
-        return {"intent": intent}
+    with open("users.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["user_id", "username", "name", "orders", "last"])
+        w.writeheader()
+        for r in rows.values():
+            w.writerow(r)
 
-    sys_prompt = (
-        "Ты NLU-экстрактор для бота VIP-такси. Верни ЧИСТЫЙ JSON (без пояснений) "
-        "с намерением пользователя и извлечёнными слотами заказа.\n"
-        "intent: one of ['order','translate','chitchat'].\n"
-        "Слоты (если можно извлечь): pickup, drop, when, car_class (Business/S/Minivan), passengers (int), contact.\n"
-        "Если слота нет — не указывай или оставь пустым. Верни ТОЛЬКО JSON."
+# ======================== КОМАНДЫ =========================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = (
+        f"Добро пожаловать в {BRAND_NAME}.\n"
+        "Ваш комфорт — наш приоритет.\n\n"
+        "Выберите действие в меню ниже.\n"
+        "Или отправьте геолокацию — подача по вашей точке."
     )
-    r = client.chat.completions.create(
-        model=MODEL_NAME,
-        response_format={"type": "json_object"},
-        temperature=0.1,
-        messages=[
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": text},
-        ],
-    )
-    import json
-    try:
-        data = json.loads(r.choices[0].message.content)
-    except Exception as e:
-        log.warning(f"NLU parse failed: {e}")
-        return {"intent": "chitchat"}
+    await (update.message or update.callback_query.message).reply_text(txt, reply_markup=main_menu())
 
-    # нормализация
-    if "car_class" in data and data["car_class"]:
-        data["car_class"] = normalize_car_class(str(data["car_class"])) or data["car_class"]
-    if "passengers" in data and data["passengers"] not in (None, ""):
+async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start(update, context)
+
+async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = ["Тарифы:"]
+    for k, v in PRICES.items():
+        lines.append(f"• {k}: {v}")
+    lines.append("\nОпции: ожидание, встреча с табличкой, детское кресло — по запросу.")
+    await update.message.reply_text("\n".join(lines))
+
+async def fleet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    for cls in ["S-Class W222", "Maybach W222", "S-Class W223", "Maybach W223", "Business", "Minivan"]:
+        url = CAR_PHOTOS[cls]
+        descr = CAR_DESCR[cls]
         try:
-            data["passengers"] = int(data["passengers"])
+            await update.message.reply_photo(photo=url, caption=f"{cls}\n{descr}\n{PRICES.get(cls, '')}")
         except Exception:
-            data["passengers"] = None
-    return data
+            await update.message.reply_text(f"{cls}\n{descr}\n{PRICES.get(cls, '')}")
 
-async def ask_next_missing_slot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Спрашиваем следующий необходимый слот. Возвращаем состояние."""
-    o = context.user_data.setdefault("order", {})
-    if not o.get("pickup"):
-        await update.message.reply_text("📍 Укажите *адрес подачи* (улица, дом):", parse_mode="Markdown")
-        return PICKUP
-    if not o.get("drop"):
-        await update.message.reply_text("🎯 Укажите *адрес назначения*:", parse_mode="Markdown")
-        return DROP
-    if not o.get("car_class"):
-        await update.message.reply_text("🚘 Выберите *класс авто*: Business / S / Minivan", parse_mode="Markdown")
-        return CAR_CLASS
-    if not o.get("when"):
-        await update.message.reply_text("⏰ Когда подать автомобиль? (например: сейчас, 19:30, завтра 10:00)")
-        return WHEN
-    if not o.get("passengers"):
-        await update.message.reply_text("👥 Сколько пассажиров будет ехать? (число)")
-        return WHEN  # используем WHEN для простоты
-    if not o.get("contact"):
-        await update.message.reply_text("📞 Оставьте контакт (имя и телефон):")
-        return CONTACT
-
-    # Всё собрано — сводка и подтверждение
-    summary = (
-        "Проверьте заказ:\n"
-        f"• Подача: {o['pickup']}\n"
-        f"• Назначение: {o['drop']}\n"
-        f"• Класс авто: {o['car_class']}\n"
-        f"• Время: {o['when']}\n"
-        f"• Пассажиров: {o['passengers']}\n"
-        f"• Контакт: {o['contact']}\n\n"
-        "Если всё верно, напишите *Подтверждаю*. Для отмены — /cancel"
+async def vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = (
+        "VIP-опции:\n"
+        "• Салфетки, вода, зарядки\n"
+        "• Встреча с табличкой\n"
+        "• Ожидание и остановки по пути\n"
+        "• Детское кресло по запросу"
     )
-    await update.message.reply_text(summary, parse_mode="Markdown")
-    return CONFIRM
+    await update.message.reply_text(txt)
 
-# ========= СЦЕНАРИЙ ЗАКАЗА =========
+async def contact_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Диспетчер: пишите здесь — ответим в чате.\nРезервный номер: +7 XXX XXX-XX-XX")
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Укажите номер заказа или дату — проверим статус и вернёмся к вам.")
+
+# ======================== ОТЗЫВЫ =========================
+FEEDBACK_RATING, FEEDBACK_TEXT = range(2)
+
+async def feedback_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Оцените поездку от 1 до 5.")
+    return FEEDBACK_RATING
+
+async def feedback_rating(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = update.message.text.strip()
+    if not txt.isdigit() or not (1 <= int(txt) <= 5):
+        await update.message.reply_text("Введите число от 1 до 5.")
+        return FEEDBACK_RATING
+    context.user_data["feedback_rating"] = int(txt)
+    await update.message.reply_text("Оставьте короткий комментарий.")
+    return FEEDBACK_TEXT
+
+async def feedback_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    comment = update.message.text.strip()
+    rating = context.user_data.pop("feedback_rating", 5)
+    save_feedback(rating, comment, update.effective_user)
+    if ADMIN_CHAT_ID:
+        try:
+            await context.bot.send_message(
+                ADMIN_CHAT_ID,
+                f"⭐ Отзыв от @{update.effective_user.username or 'user'} (ID {update.effective_user.id}):\n"
+                f"Оценка: {rating}\nКомментарий: {comment}"
+            )
+        except Exception as e:
+            log.warning(f"Admin notify failed: {e}")
+    await update.message.reply_text("Спасибо. Мы ценим ваше мнение.")
+    return ConversationHandler.END
+
+async def feedback_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Отзыв отменён.")
+    return ConversationHandler.END
+
+# ======================== VIP-КАРТА =========================
+async def vipcard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    name = (update.effective_user.first_name or "").strip()
+    trips = 0
+    if os.path.exists("users.csv"):
+        with open("users.csv", "r", encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                if int(r["user_id"]) == uid:
+                    trips = int(r.get("orders", 0))
+                    name = r.get("name") or name
+                    break
+    await update.message.reply_text(
+        f"🪪 VIP Card\nИмя: {name}\nID: {uid}\nПоездок: {trips}\nСтатус: Premium"
+    )
+
+# ======================== ОПЛАТА (ИМИТАЦИЯ) =========================
+async def pay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    order_id = str(uuid4())[:8]
+    amount = 3500
+    txt = f"💳 Оплата заказа #{order_id}\nСумма: {amount} ₽\nУслуга: Подача {BRAND_NAME}"
+    await update.message.reply_text(txt, reply_markup=pay_button(order_id, amount))
+
+async def on_pay_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    _, order_id, amount = q.data.split(":")
+    await q.edit_message_text(f"✅ Оплата заказа #{order_id} на {amount} ₽ выполнена (демо).")
+    if ADMIN_CHAT_ID:
+        try:
+            user = update.effective_user
+            await context.bot.send_message(
+                ADMIN_CHAT_ID,
+                f"💰 Оплата (демо): заказ #{order_id} на {amount} ₽ от @{user.username or 'user'} (ID {user.id})"
+            )
+        except Exception as e:
+            log.warning(f"Admin notify failed: {e}")
+
+# ======================== ЗАКАЗ =========================
+def class_inline_caption(car_name: str) -> str:
+    return f"{car_name}\n{CAR_DESCR.get(car_name, '')}\n{PRICES.get(car_name, '')}"
+
 async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["order"] = {}
-    await update.message.reply_text("📍 Укажите *адрес подачи* (улица, дом):", parse_mode="Markdown")
+    context.user_data["order"] = {"paid": 0}
+    await update.message.reply_text(
+        "Укажите адрес подачи или отправьте свою геолокацию кнопкой ниже.",
+        reply_markup=pickup_location_kb()
+    )
     return PICKUP
 
 async def order_pickup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["order"]["pickup"] = update.message.text.strip()
-    return await ask_next_missing_slot(update, context)
+    await update.message.reply_text("Укажите адрес назначения.")
+    return DROP
 
 async def order_drop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["order"]["drop"] = update.message.text.strip()
-    return await ask_next_missing_slot(update, context)
+    await update.message.reply_text("Выберите класс автомобиля:", reply_markup=car_choice_kb())
+    return CAR_CLASS
 
-async def order_car_class(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cls = normalize_car_class(update.message.text.strip())
-    if not cls:
-        await update.message.reply_text("Пожалуйста, выберите из вариантов: Business / S / Minivan.")
-        return CAR_CLASS
-    context.user_data["order"]["car_class"] = cls
-    return await ask_next_missing_slot(update, context)
+async def on_car_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    _, car = q.data.split(":", 1)
+    context.user_data["order"]["car"] = car
+    url = CAR_PHOTOS.get(car)
+    caption = class_inline_caption(car)
+    try:
+        await q.message.reply_photo(photo=url, caption=caption)
+    except Exception:
+        await q.message.reply_text(caption)
+    await q.message.reply_text("Когда подать автомобиль? (например: 10:00 сегодня / завтра 19:30)")
+    return WHEN
 
 async def order_when(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text.strip()
     o = context.user_data["order"]
-    # если ждём число пассажиров
-    if not o.get("passengers"):
-        # попробуем извлечь число
-        digits = "".join(ch for ch in txt if ch.isdigit())
-        if digits:
-            try:
-                o["passengers"] = int(digits)
-                return await ask_next_missing_slot(update, context)
-            except Exception:
-                pass
-    # иначе — это время
-    if not o.get("when"):
+    if ":" in txt or any(k in txt.lower() for k in ["сегодня", "завтра", "вечер", "утро", "ночь"]):
         o["when"] = txt
-        return await ask_next_missing_slot(update, context)
-    # если и время уже есть, а нас всё ещё сюда прислали — просто спросим следующее
-    return await ask_next_missing_slot(update, context)
+        await update.message.reply_text("Сколько пассажиров?")
+        return PASSENGERS
+    digits = "".join(ch for ch in txt if ch.isdigit())
+    if digits:
+        try:
+            o["passengers"] = int(digits)
+            await update.message.reply_text("Когда подать автомобиль?")
+            return WHEN
+        except:
+            pass
+    await update.message.reply_text("Уточните: это время или количество пассажиров?")
+    return WHEN
+
+async def order_passengers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    digits = "".join(ch for ch in update.message.text if ch.isdigit())
+    if not digits:
+        await update.message.reply_text("Введите число пассажиров (например, 2).")
+        return PASSENGERS
+    context.user_data["order"]["passengers"] = int(digits)
+    await update.message.reply_text("Оставьте контакт (имя и телефон).")
+    return CONTACT
 
 async def order_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["order"]["contact"] = update.message.text.strip()
-    return await ask_next_missing_slot(update, context)
+    o = context.user_data["order"]
+    summary = (
+        "Проверьте заказ:\n"
+        f"• Подача: {o.get('pickup')}\n"
+        f"• Назначение: {o.get('drop')}\n"
+        f"• Класс: {o.get('car')}\n"
+        f"• Время: {o.get('when')}\n"
+        f"• Пассажиров: {o.get('passengers')}\n"
+        f"• Контакт: {o.get('contact')}\n\n"
+        "Если всё верно — напишите «Подтверждаю». Для отмены — /cancel."
+    )
+    await update.message.reply_text(summary)
+    return CONFIRM
 
 async def order_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.text.strip().lower().startswith("подтвержда"):
-        await update.message.reply_text("Напишите *Подтверждаю* или используйте /cancel.", parse_mode="Markdown")
+    if not update.message.text.lower().startswith("подтвержда"):
+        await update.message.reply_text("Напишите «Подтверждаю» или используйте /cancel.")
         return CONFIRM
 
-    ensure_orders_csv()
     o = context.user_data["order"]
     user = update.effective_user
+    save_order(o, user)
+    save_user_stat(user)
 
-    with open("orders.csv", "a", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow([
-            datetime.utcnow().isoformat(), user.id, user.username,
-            o["pickup"], o["drop"], o["car_class"], o["when"], o["passengers"], o["contact"]
-        ])
-
-    # уведомления
-    admin_text = (
-        "🆕 <b>Новый заказ</b>\n"
-        f"👤 От: @{user.username or 'без_username'} (ID {user.id})\n"
-        f"📍 Подача: {o['pickup']}\n"
-        f"🏁 Назначение: {o['drop']}\n"
-        f"🚘 Класс: {o['car_class']}\n"
-        f"👥 Пассажиров: {o['passengers']}\n"
-        f"⏰ Время: {o['when']}\n"
-        f"☎️ Контакт: {o['contact']}"
-    )
     if ADMIN_CHAT_ID and user.id != ADMIN_CHAT_ID:
         try:
-            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=admin_text, parse_mode="HTML")
+            admin_text = (
+                "🆕 Новый заказ\n"
+                f"Подача: {o.get('pickup')}\n"
+                f"Назначение: {o.get('drop')}\n"
+                f"Класс: {o.get('car')}\n"
+                f"Время: {o.get('when')}\n"
+                f"Пассажиров: {o.get('passengers')}\n"
+                f"Контакт: {o.get('contact')}\n"
+                f"От: @{user.username or 'user'} (ID {user.id})"
+            )
+            await context.bot.send_message(ADMIN_CHAT_ID, admin_text)
         except Exception as e:
-            log.warning(f"Failed to notify admin: {e}")
+            log.warning(f"Admin notify failed: {e}")
 
-    await update.message.reply_text("✅ Заказ принят! Мы свяжемся с вами для подтверждения.")
+    await update.message.reply_text("Заказ принят. Водитель свяжется с вами.")
+    order_id = str(uuid4())[:8]
+    amount = 3500
+    await update.message.reply_text(
+        f"Сумма к оплате — {amount} ₽.",
+        reply_markup=pay_button(order_id, amount)
+    )
     context.user_data.pop("order", None)
     return ConversationHandler.END
 
 async def order_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("order", None)
-    await update.message.reply_text("Отменено. Могу помочь с новым заказом через /order.")
+    await update.message.reply_text("Оформление отменено.")
     return ConversationHandler.END
 
-# ========= ПЕРЕВОД =========
-async def translate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not LLM_ENABLED:
-        await update.message.reply_text("Перевод недоступен: нет LLM_API_KEY.")
+# ======================== ГЕОЛОКАЦИЯ (УЛУЧШЕННО) =========================
+async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    loc = update.message.location
+    if not loc:
         return
-    text = " ".join(context.args) if context.args else None
-    if not text:
-        context.user_data["await_translate"] = True
-        await update.message.reply_text("Отправьте текст, и я переведу RU↔EN.")
-        return
-    try:
-        r = client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": "Ты переводчик RU↔EN. Переводи кратко и точно."},
-                {"role": "user", "content": text},
-            ],
-            temperature=0.2,
+    lat, lon = loc.latitude, loc.longitude
+    maps = f"https://maps.google.com/?q={lat:.6f},{lon:.6f}"
+
+    o = context.user_data.get("order")
+
+    # Если заказ ещё не начинали — стартуем и берём эту точку как адрес подачи
+    if not o:
+        context.user_data["order"] = {"paid": 0, "pickup": f"{lat:.6f},{lon:.6f}"}
+        await update.message.reply_text(
+            f"Локация принята как адрес подачи.\n{maps}\n\nУкажите адрес назначения."
         )
-        await update.message.reply_text(r.choices[0].message.content)
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка перевода: {e}")
+        return DROP
 
-# ========= ОБЩИЙ ХЭНДЛЕР СООБЩЕНИЙ (ИИ+NLU) =========
-async def ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
+    # Если ждём подачу — возьмём точку как подачу
+    if "pickup" not in context.user_data["order"]:
+        context.user_data["order"]["pickup"] = f"{lat:.6f},{lon:.6f}"
+        await update.message.reply_text(
+            f"Локация принята как адрес подачи.\n{maps}\n\nУкажите адрес назначения."
+        )
+        return DROP
 
-    # режим «жду текст для перевода»
-    if context.user_data.get("await_translate"):
-        context.user_data.pop("await_translate", None)
-        if not LLM_ENABLED:
-            await update.message.reply_text("Перевод недоступен: нет LLM_API_KEY.")
-            return
-        try:
-            r = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=[
-                    {"role": "system", "content": "Ты переводчик RU↔EN. Переводи кратко и точно."},
-                    {"role": "user", "content": text},
-                ],
-                temperature=0.2,
-            )
-            await update.message.reply_text(r.choices[0].message.content)
-        except Exception as e:
-            await update.message.reply_text(f"Ошибка перевода: {e}")
-        return
+    # Если подача уже есть, но нет назначения — поставим точку как назначение
+    if "drop" not in context.user_data["order"]:
+        context.user_data["order"]["drop"] = f"{lat:.6f},{lon:.6f}"
+        await update.message.reply_text(
+            f"Точка назначения принята.\n{maps}\n\nКогда подать автомобиль?"
+        )
+        return WHEN
 
-    # NLU: распознать намерение и извлечь слоты
-    nlu = await nlu_extract(text)
-    intent = nlu.get("intent") or "chitchat"
+    # Иначе просто подтверждаем приём локации
+    await update.message.reply_text("Локация получена.")
 
-    if intent == "order":
-        o = context.user_data.setdefault("order", {})
-        for k in ("pickup", "drop", "when", "contact"):
-            if nlu.get(k):
-                o[k] = nlu[k]
-        if nlu.get("car_class"):
-            o["car_class"] = normalize_car_class(nlu["car_class"]) or nlu["car_class"]
-        if nlu.get("passengers"):
-            try:
-                o["passengers"] = int(nlu["passengers"])
-            except Exception:
-                pass
-        await ask_next_missing_slot(update, context)
-        return
+# ======================== ТЕКСТЫ ИЗ МЕНЮ =========================
+async def on_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = (update.message.text or "").lower()
+    if "заказ" in txt:
+        return await order_start(update, context)
+    if "автопарк" in txt:
+        return await fleet_cmd(update, context)
+    if "оплата" in txt:
+        return await pay_cmd(update, context)
+    if "контакт" in txt:
+        return await contact_cmd(update, context)
+    if "отзыв" in txt:
+        return await feedback_start(update, context)
+    if "vip" in txt or "карта" in txt:
+        return await vipcard_cmd(update, context)
+    return await start(update, context)
 
-    if intent == "translate":
-        await translate_cmd(update, context)
-        return
-
-    # короткий ответ ИИ, не сбивая сценарий
-    if not LLM_ENABLED:
-        await update.message.reply_text("Готов помочь с заказом. Нажмите «🛎 Заказ /order» или введите /order.")
-        return
-    r = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
-            {"role": "system",
-             "content": "Ты вежливый ассистент VIP-такси. Отвечай очень кратко и предлагай оформить заказ командой /order."},
-            {"role": "user", "content": text},
-        ],
-        temperature=0.3,
-    )
-    await update.message.reply_text(r.choices[0].message.content)
-
-# ========= СБОРКА ПРИЛОЖЕНИЯ =========
+# ======================== РЕГИСТРАЦИЯ ХЭНДЛЕРОВ =========================
 def build_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
 
     async def set_commands(app_):
         cmds = [
-            BotCommand("start", "запустить бота"),
-            BotCommand("help", "помощь и описание функций"),
-            BotCommand("order", "оформить заказ VIP-такси"),
-            BotCommand("translate", "перевести текст ru/en"),
-            BotCommand("info", "информация и контакты"),
-            BotCommand("cancel", "отменить оформление заказа"),
+            BotCommand("start", "начать и меню"),
+            BotCommand("order", "оформить заказ"),
+            BotCommand("price", "тарифы"),
+            BotCommand("fleet", "автопарк"),
+            BotCommand("vip", "vip-опции"),
+            BotCommand("status", "статус заказа"),
+            BotCommand("contact", "контакты"),
+            BotCommand("feedback", "оставить отзыв"),
+            BotCommand("vipcard", "моя vip-карта"),
+            BotCommand("pay", "оплата (демо)"),
+            BotCommand("menu", "показать меню"),
+            BotCommand("cancel", "отменить оформление"),
         ]
         await app_.bot.set_my_commands(cmds)
-
     app.post_init = set_commands
 
     # Команды
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("info", info_cmd))
-    app.add_handler(CommandHandler("translate", translate_cmd))
+    app.add_handler(CommandHandler("menu", menu_cmd))
+    app.add_handler(CommandHandler("price", price_cmd))
+    app.add_handler(CommandHandler("fleet", fleet_cmd))
+    app.add_handler(CommandHandler("vip", vip_cmd))
+    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("contact", contact_cmd))
+    app.add_handler(CommandHandler("vipcard", vipcard_cmd))
+    app.add_handler(CommandHandler("pay", pay_cmd))
 
-    # Диалог заказа
+    # Отзывы
+    feedback_conv = ConversationHandler(
+        entry_points=[CommandHandler("feedback", feedback_start)],
+        states={
+            FEEDBACK_RATING: [MessageHandler(filters.TEXT & ~filters.COMMAND, feedback_rating)],
+            FEEDBACK_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, feedback_text)],
+        },
+        fallbacks=[CommandHandler("cancel", feedback_cancel)],
+    )
+    app.add_handler(feedback_conv)
+
+    # Заказ
     order_conv = ConversationHandler(
         entry_points=[CommandHandler("order", order_start)],
         states={
             PICKUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_pickup)],
             DROP: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_drop)],
-            CAR_CLASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_car_class)],
+            CAR_CLASS: [CallbackQueryHandler(on_car_choice, pattern=r"^car:")],
             WHEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_when)],
+            PASSENGERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_passengers)],
             CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_contact)],
             CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_confirm)],
         },
@@ -410,14 +497,20 @@ def build_app() -> Application:
     )
     app.add_handler(order_conv)
 
-    # ИИ / NLU для всех прочих текстов
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ai_chat))
+    # Геолокация
+    app.add_handler(MessageHandler(filters.LOCATION, on_location))
+
+    # Кнопки callback: оплата (демо) и выбор авто
+    app.add_handler(CallbackQueryHandler(on_pay_click, pattern=r"^pay:"))
+
+    # Тексты из меню-кнопок
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_menu))
 
     return app
 
 def main():
     app = build_app()
-    log.info("Starting VIP Taxi bot polling...")
+    log.info("Starting VIP taxi bot…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
