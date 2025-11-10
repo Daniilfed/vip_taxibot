@@ -1,8 +1,10 @@
+# -*- coding: utf-8 -*-
 import os
 import csv
+import math
 import logging
-from datetime import datetime
 from uuid import uuid4
+from datetime import datetime
 
 from telegram import (
     Update,
@@ -22,82 +24,93 @@ from telegram.ext import (
     filters,
 )
 
-# ======================== НАСТРОЙКИ =========================
+# ====================== НАСТРОЙКА ==========================
 BRAND_NAME = "VIP taxi"
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "143710784"))
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 assert BOT_TOKEN, "BOT_TOKEN is required"
 
-# Реальные фото (Unsplash, нейтральные, без водяных знаков)
+# Фото автопарка (Unsplash; нейтральные, без водяных знаков)
 CAR_PHOTOS = {
     "S-Class W222": "https://images.unsplash.com/photo-1615732045871-8db6d1dc8723",
     "Maybach W222": "https://images.unsplash.com/photo-1624784194858-4e1cb2e54c56",
     "S-Class W223": "https://images.unsplash.com/photo-1649254362283-5c9b83a3d31f",
     "Maybach W223": "https://images.unsplash.com/photo-1650659020204-3d8e60d2dcbb",
-    "Business": "https://images.unsplash.com/photo-1606813902915-5c2b66f04e8e",  # E-Class / BMW 5
+    "Business": "https://images.unsplash.com/photo-1606813902915-5c2b66f04e8e",   # E-Class / BMW 5
     "Minivan": "https://images.unsplash.com/photo-1618401471383-5e00764f9a72",  # V-Class
 }
 
 CAR_DESCR = {
     "S-Class W222": "Mercedes-Benz S-Class (W222). Кожаный салон, салфетки, вода, зарядки.",
-    "Maybach W222": "Mercedes-Maybach (W222). Индивидуальные кресла, салфетки, вода, зарядки.",
+    "Maybach W222": "Mercedes-Maybach (W222). Индивидуальные кресла; салфетки, вода, зарядки.",
     "S-Class W223": "Mercedes-Benz S-Class (W223). Новое поколение; салфетки, вода, зарядки.",
     "Maybach W223": "Mercedes-Maybach (W223). Флагман люкса: массаж, подсветка; вода и зарядки.",
     "Business": "Mercedes E-Class / BMW 5. Комфортный седан, вода и зарядки.",
     "Minivan": "Mercedes V-Class. До 6 пассажиров; салфетки, вода, зарядки; детское кресло по запросу.",
 }
 
+# 💰 АКТУАЛЬНЫЕ ТАРИФЫ
 PRICES = {
-    "S-Class W222": "от 2000 ₽/ч",
-    "Maybach W222": "от 2600 ₽/ч",
-    "S-Class W223": "от 2300 ₽/ч",
-    "Maybach W223": "от 3000 ₽/ч",
-    "Business": "от 1200 ₽/ч",
-    "Minivan": "от 1500 ₽/ч",
+    "Maybach W223": "7000 ₽/ч",
+    "Maybach W222": "4000 ₽/ч",
+    "S-Class W223": "5000 ₽/ч",
+    "S-Class W222": "3000 ₽/ч",
+    "Business": "2000 ₽/ч",
+    "Minivan": "3000 ₽/ч",
 }
 
-# ======================== ЛОГИ =========================
+# Для примерного расчёта стоимости по расстоянию (руб/км)
+RATE_PER_KM = {
+    "Maybach W223": 120,
+    "Maybach W222": 90,
+    "S-Class W223": 100,
+    "S-Class W222": 70,
+    "Business": 50,
+    "Minivan": 60,
+}
+BASE_FEE = 500  # базовая подача
+
+# ====================== ЛОГИ ==============================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("vip_taxi_bot")
 
-# ======================== КЛАВИАТУРЫ =========================
-def main_menu():
-    return ReplyKeyboardMarkup(
-        [
-            [KeyboardButton("🛎 Заказ"), KeyboardButton("🚗 Автопарк")],
-            [KeyboardButton("💳 Оплата"), KeyboardButton("📞 Контакты")],
-            [KeyboardButton("⭐ Отзыв"), KeyboardButton("🪪 VIP-карта")],
-            [KeyboardButton("📍 Геолокация", request_location=True)],
-        ],
-        resize_keyboard=True,
-    )
+# ====================== ВСПОМОГАТЕЛЬНОЕ ===================
+def _try_coords(s: str):
+    """'55.751244,37.618423' -> (lat, lon) | None"""
+    if not s or "," not in s:
+        return None
+    a, b = s.split(",", 1)
+    try:
+        return float(a), float(b)
+    except Exception:
+        return None
 
-def pickup_location_kb():
-    return ReplyKeyboardMarkup(
-        [[KeyboardButton("📍 Отправить мою геолокацию", request_location=True)]],
-        resize_keyboard=True, one_time_keyboard=True
-    )
+def haversine_km(lat1, lon1, lat2, lon2):
+    """Расстояние между точками (км)"""
+    R = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlmb = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dlmb/2)**2
+    return 2*R*math.asin(math.sqrt(a))
 
-def car_choice_kb():
-    rows = [
-        [InlineKeyboardButton("S-Class W222", callback_data="car:S-Class W222"),
-         InlineKeyboardButton("Maybach W222", callback_data="car:Maybach W222")],
-        [InlineKeyboardButton("S-Class W223", callback_data="car:S-Class W223"),
-         InlineKeyboardButton("Maybach W223", callback_data="car:Maybach W223")],
-        [InlineKeyboardButton("Business", callback_data="car:Business"),
-         InlineKeyboardButton("Minivan", callback_data="car:Minivan")],
-    ]
-    return InlineKeyboardMarkup(rows)
+def estimate_price(order: dict) -> int | None:
+    """Ориентировочная цена по координатам и классу"""
+    car = order.get("car")
+    if not car:
+        return None
+    rate = RATE_PER_KM.get(car)
+    if not rate:
+        return None
+    c1 = _try_coords(order.get("pickup", ""))
+    c2 = _try_coords(order.get("drop", ""))
+    if not (c1 and c2):
+        return None
+    dist = haversine_km(c1[0], c1[1], c2[0], c2[1])
+    rough = int(round(BASE_FEE + dist * rate, -1))  # округлим до десятков
+    return max(rough, BASE_FEE)
 
-def pay_button(order_id: str, amount: int):
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(f"Оплатить {amount} ₽", callback_data=f"pay:{order_id}:{amount}")]]
-    )
-
-# ======================== СОСТОЯНИЯ =========================
-PICKUP, DROP, CAR_CLASS, WHEN, PASSENGERS, CONTACT, CONFIRM = range(7)
-
-# ======================== ХРАНИЛКА =========================
 def ensure_csv(path: str, header: list[str]):
     if not os.path.exists(path):
         with open(path, "w", newline="", encoding="utf-8") as f:
@@ -143,7 +156,45 @@ def save_user_stat(user):
         for r in rows.values():
             w.writerow(r)
 
-# ======================== КОМАНДЫ =========================
+# ====================== КЛАВИАТУРЫ ========================
+def main_menu():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("🛎 Заказ"), KeyboardButton("🚗 Автопарк")],
+            [KeyboardButton("💳 Оплата"), KeyboardButton("📞 Контакты")],
+            [KeyboardButton("⭐ Отзыв"), KeyboardButton("🪪 VIP-карта")],
+            [KeyboardButton("📍 Геолокация", request_location=True)],
+        ],
+        resize_keyboard=True,
+    )
+
+def pickup_location_kb():
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("📍 Отправить мою геолокацию", request_location=True)]],
+        resize_keyboard=True, one_time_keyboard=True
+    )
+
+def car_choice_kb():
+    rows = [
+        [InlineKeyboardButton("S-Class W222", callback_data="car:S-Class W222"),
+         InlineKeyboardButton("Maybach W222", callback_data="car:Maybach W222")],
+        [InlineKeyboardButton("S-Class W223", callback_data="car:S-Class W223"),
+         InlineKeyboardButton("Maybach W223", callback_data="car:Maybach W223")],
+        [InlineKeyboardButton("Business", callback_data="car:Business"),
+         InlineKeyboardButton("Minivan", callback_data="car:Minivan")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+def pay_button(order_id: str, amount: int):
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(f"Оплатить {amount} ₽", callback_data=f"pay:{order_id}:{amount}")]]
+    )
+
+# ====================== СОСТОЯНИЯ =========================
+PICKUP, DROP, CAR_CLASS, WHEN, PASSENGERS, CONTACT, CONFIRM = range(7)
+FEEDBACK_RATING, FEEDBACK_TEXT = range(2)
+
+# ====================== КОМАНДЫ ===========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (
         f"Добро пожаловать в {BRAND_NAME}.\n"
@@ -188,9 +239,7 @@ async def contact_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Укажите номер заказа или дату — проверим статус и вернёмся к вам.")
 
-# ======================== ОТЗЫВЫ =========================
-FEEDBACK_RATING, FEEDBACK_TEXT = range(2)
-
+# ====================== ОТЗЫВЫ ============================
 async def feedback_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Оцените поездку от 1 до 5.")
     return FEEDBACK_RATING
@@ -224,7 +273,7 @@ async def feedback_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Отзыв отменён.")
     return ConversationHandler.END
 
-# ======================== VIP-КАРТА =========================
+# ====================== VIP-КАРТА =========================
 async def vipcard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     name = (update.effective_user.first_name or "").strip()
@@ -240,12 +289,17 @@ async def vipcard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🪪 VIP Card\nИмя: {name}\nID: {uid}\nПоездок: {trips}\nСтатус: Premium"
     )
 
-# ======================== ОПЛАТА (ИМИТАЦИЯ) =========================
+# ====================== ОПЛАТА (ДЕМО) =====================
+def pay_keyboard(order_id: str, amount: int):
+    return InlineKeyboardMarkup([[InlineKeyboardButton(f"Оплатить {amount} ₽", callback_data=f"pay:{order_id}:{amount}")]])
+
 async def pay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     order_id = str(uuid4())[:8]
     amount = 3500
-    txt = f"💳 Оплата заказа #{order_id}\nСумма: {amount} ₽\nУслуга: Подача {BRAND_NAME}"
-    await update.message.reply_text(txt, reply_markup=pay_button(order_id, amount))
+    await update.message.reply_text(
+        f"💳 Оплата заказа #{order_id}\nСумма: {amount} ₽\nУслуга: Подача {BRAND_NAME}",
+        reply_markup=pay_keyboard(order_id, amount)
+    )
 
 async def on_pay_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -253,8 +307,8 @@ async def on_pay_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, order_id, amount = q.data.split(":")
     await q.edit_message_text(f"✅ Оплата заказа #{order_id} на {amount} ₽ выполнена (демо).")
     if ADMIN_CHAT_ID:
+        user = update.effective_user
         try:
-            user = update.effective_user
             await context.bot.send_message(
                 ADMIN_CHAT_ID,
                 f"💰 Оплата (демо): заказ #{order_id} на {amount} ₽ от @{user.username or 'user'} (ID {user.id})"
@@ -262,8 +316,8 @@ async def on_pay_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             log.warning(f"Admin notify failed: {e}")
 
-# ======================== ЗАКАЗ =========================
-def class_inline_caption(car_name: str) -> str:
+# ====================== ОФОРМЛЕНИЕ ЗАКАЗА =================
+def class_caption(car_name: str) -> str:
     return f"{car_name}\n{CAR_DESCR.get(car_name, '')}\n{PRICES.get(car_name, '')}"
 
 async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -290,7 +344,7 @@ async def on_car_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, car = q.data.split(":", 1)
     context.user_data["order"]["car"] = car
     url = CAR_PHOTOS.get(car)
-    caption = class_inline_caption(car)
+    caption = class_caption(car)
     try:
         await q.message.reply_photo(photo=url, caption=caption)
     except Exception:
@@ -311,7 +365,7 @@ async def order_when(update: Update, context: ContextTypes.DEFAULT_TYPE):
             o["passengers"] = int(digits)
             await update.message.reply_text("Когда подать автомобиль?")
             return WHEN
-        except:
+        except Exception:
             pass
     await update.message.reply_text("Уточните: это время или количество пассажиров?")
     return WHEN
@@ -328,14 +382,19 @@ async def order_passengers(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def order_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["order"]["contact"] = update.message.text.strip()
     o = context.user_data["order"]
+
+    price_hint = estimate_price(o)
+    price_line = f"\n💸 Ориентировочная стоимость: ~{price_hint} ₽" if price_hint else ""
+
     summary = (
         "Проверьте заказ:\n"
         f"• Подача: {o.get('pickup')}\n"
         f"• Назначение: {o.get('drop')}\n"
-        f"• Класс: {o.get('car')}\n"
+        f"• Класс авто: {o.get('car')}\n"
         f"• Время: {o.get('when')}\n"
         f"• Пассажиров: {o.get('passengers')}\n"
-        f"• Контакт: {o.get('contact')}\n\n"
+        f"• Контакт: {o.get('contact')}"
+        f"{price_line}\n\n"
         "Если всё верно — напишите «Подтверждаю». Для отмены — /cancel."
     )
     await update.message.reply_text(summary)
@@ -353,26 +412,22 @@ async def order_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if ADMIN_CHAT_ID and user.id != ADMIN_CHAT_ID:
         try:
-            admin_text = (
+            await context.bot.send_message(
+                ADMIN_CHAT_ID,
                 "🆕 Новый заказ\n"
-                f"Подача: {o.get('pickup')}\n"
-                f"Назначение: {o.get('drop')}\n"
-                f"Класс: {o.get('car')}\n"
-                f"Время: {o.get('when')}\n"
-                f"Пассажиров: {o.get('passengers')}\n"
-                f"Контакт: {o.get('contact')}\n"
+                f"Подача: {o.get('pickup')}\nНазначение: {o.get('drop')}\n"
+                f"Класс: {o.get('car')}\nВремя: {o.get('when')}\n"
+                f"Пассажиров: {o.get('passengers')}\nКонтакт: {o.get('contact')}\n"
                 f"От: @{user.username or 'user'} (ID {user.id})"
             )
-            await context.bot.send_message(ADMIN_CHAT_ID, admin_text)
         except Exception as e:
             log.warning(f"Admin notify failed: {e}")
 
     await update.message.reply_text("Заказ принят. Водитель свяжется с вами.")
-    order_id = str(uuid4())[:8]
-    amount = 3500
+    order_id, amount = str(uuid4())[:8], 3500
     await update.message.reply_text(
         f"Сумма к оплате — {amount} ₽.",
-        reply_markup=pay_button(order_id, amount)
+        reply_markup=pay_keyboard(order_id, amount)
     )
     context.user_data.pop("order", None)
     return ConversationHandler.END
@@ -382,7 +437,7 @@ async def order_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Оформление отменено.")
     return ConversationHandler.END
 
-# ======================== ГЕОЛОКАЦИЯ (УЛУЧШЕННО) =========================
+# ====================== ГЕОЛОКАЦИЯ (УЛУЧШЕННО) =============
 async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loc = update.message.location
     if not loc:
@@ -390,36 +445,29 @@ async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lat, lon = loc.latitude, loc.longitude
     maps = f"https://maps.google.com/?q={lat:.6f},{lon:.6f}"
 
-    o = context.user_data.get("order")
+    order = context.user_data.get("order")
 
-    # Если заказ ещё не начинали — стартуем и берём эту точку как адрес подачи
-    if not o:
+    # если заказ не начат — считаем локацию подачей
+    if not order:
         context.user_data["order"] = {"paid": 0, "pickup": f"{lat:.6f},{lon:.6f}"}
         await update.message.reply_text(
-            f"Локация принята как адрес подачи.\n{maps}\n\nУкажите адрес назначения."
+            f"📍 Локация подачи сохранена.\n{maps}\n\nТеперь укажите адрес назначения "
+            f"или отправьте вторую геолокацию."
         )
         return DROP
 
-    # Если ждём подачу — возьмём точку как подачу
-    if "pickup" not in context.user_data["order"]:
-        context.user_data["order"]["pickup"] = f"{lat:.6f},{lon:.6f}"
+    # если есть подача, но нет назначения — это назначение
+    if "pickup" in order and "drop" not in order:
+        order["drop"] = f"{lat:.6f},{lon:.6f}"
         await update.message.reply_text(
-            f"Локация принята как адрес подачи.\n{maps}\n\nУкажите адрес назначения."
-        )
-        return DROP
-
-    # Если подача уже есть, но нет назначения — поставим точку как назначение
-    if "drop" not in context.user_data["order"]:
-        context.user_data["order"]["drop"] = f"{lat:.6f},{lon:.6f}"
-        await update.message.reply_text(
-            f"Точка назначения принята.\n{maps}\n\nКогда подать автомобиль?"
+            f"🎯 Локация назначения сохранена.\n{maps}\n\nКогда подать автомобиль?"
         )
         return WHEN
 
-    # Иначе просто подтверждаем приём локации
-    await update.message.reply_text("Локация получена.")
+    # если обе точки уже есть — просто подтверждаем
+    await update.message.reply_text("✅ Локация получена и сохранена.")
 
-# ======================== ТЕКСТЫ ИЗ МЕНЮ =========================
+# ====================== ТЕКСТЫ ИЗ МЕНЮ ====================
 async def on_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").lower()
     if "заказ" in txt:
@@ -436,7 +484,7 @@ async def on_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await vipcard_cmd(update, context)
     return await start(update, context)
 
-# ======================== РЕГИСТРАЦИЯ ХЭНДЛЕРОВ =========================
+# ====================== РЕГИСТРАЦИЯ ХЭНДЛЕРОВ =============
 def build_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -500,7 +548,8 @@ def build_app() -> Application:
     # Геолокация
     app.add_handler(MessageHandler(filters.LOCATION, on_location))
 
-    # Кнопки callback: оплата (демо) и выбор авто
+    # Callback-кнопки
+    app.add_handler(CallbackQueryHandler(on_car_choice, pattern=r"^car:"))
     app.add_handler(CallbackQueryHandler(on_pay_click, pattern=r"^pay:"))
 
     # Тексты из меню-кнопок
