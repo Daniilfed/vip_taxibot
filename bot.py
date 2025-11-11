@@ -31,26 +31,26 @@ ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "143710784"))
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 assert BOT_TOKEN, "BOT_TOKEN is required"
 
-# Фото автопарка (Unsplash; нейтральные, без водяных знаков)
+# Фото автопарка (нейтральные Unsplash)
 CAR_PHOTOS = {
     "S-Class W222": "https://images.unsplash.com/photo-1615732045871-8db6d1dc8723",
     "Maybach W222": "https://images.unsplash.com/photo-1624784194858-4e1cb2e54c56",
     "S-Class W223": "https://images.unsplash.com/photo-1649254362283-5c9b83a3d31f",
     "Maybach W223": "https://images.unsplash.com/photo-1650659020204-3d8e60d2dcbb",
-    "Business": "https://images.unsplash.com/photo-1606813902915-5c2b66f04e8e",   # E-Class / BMW 5
-    "Minivan": "https://images.unsplash.com/photo-1618401471383-5e00764f9a72",  # V-Class
+    "Business": "https://images.unsplash.com/photo-1606813902915-5c2b66f04e8e",
+    "Minivan": "https://images.unsplash.com/photo-1618401471383-5e00764f9a72",
 }
 
 CAR_DESCR = {
     "S-Class W222": "Mercedes-Benz S-Class (W222). Кожаный салон, салфетки, вода, зарядки.",
     "Maybach W222": "Mercedes-Maybach (W222). Индивидуальные кресла; салфетки, вода, зарядки.",
     "S-Class W223": "Mercedes-Benz S-Class (W223). Новое поколение; салфетки, вода, зарядки.",
-    "Maybach W223": "Mercedes-Maybach (W223). Флагман люкса: массаж, подсветка; вода и зарядки.",
+    "Maybach W223": "Mercedes-Maybach (W223). Флагман люкса: массаж; вода и зарядки.",
     "Business": "Mercedes E-Class / BMW 5. Комфортный седан, вода и зарядки.",
-    "Minivan": "Mercedes V-Class. До 6 пассажиров; салфетки, вода, зарядки; детское кресло по запросу.",
+    "Minivan": "Mercedes V-Class. До 6 пассажиров; салфетки, вода, зарядки.",
 }
 
-# 💰 АКТУАЛЬНЫЕ ТАРИФЫ
+# 💰 АКТУАЛЬНЫЕ ТАРИФЫ (строки для вывода)
 PRICES = {
     "Maybach W223": "7000 ₽/ч",
     "Maybach W222": "4000 ₽/ч",
@@ -59,8 +59,17 @@ PRICES = {
     "Business": "2000 ₽/ч",
     "Minivan": "3000 ₽/ч",
 }
+# Числовые почасовые для расчёта
+HOURLY_INT = {
+    "Maybach W223": 7000,
+    "Maybach W222": 4000,
+    "S-Class W223": 5000,
+    "S-Class W222": 3000,
+    "Business": 2000,
+    "Minivan": 3000,
+}
 
-# Для примерного расчёта стоимости по расстоянию (руб/км)
+# Оценка по расстоянию (руб/км) и базовая подача
 RATE_PER_KM = {
     "Maybach W223": 120,
     "Maybach W222": 90,
@@ -69,15 +78,14 @@ RATE_PER_KM = {
     "Business": 50,
     "Minivan": 60,
 }
-BASE_FEE = 500  # базовая подача
+BASE_FEE = 500
 
 # ====================== ЛОГИ ==============================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("vip_taxi_bot")
 
-# ====================== ВСПОМОГАТЕЛЬНОЕ ===================
+# ====================== УТИЛИТЫ ===========================
 def _try_coords(s: str):
-    """'55.751244,37.618423' -> (lat, lon) | None"""
     if not s or "," not in s:
         return None
     a, b = s.split(",", 1)
@@ -87,7 +95,6 @@ def _try_coords(s: str):
         return None
 
 def haversine_km(lat1, lon1, lat2, lon2):
-    """Расстояние между точками (км)"""
     R = 6371.0
     p1, p2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
@@ -96,7 +103,6 @@ def haversine_km(lat1, lon1, lat2, lon2):
     return 2*R*math.asin(math.sqrt(a))
 
 def estimate_price(order: dict) -> int | None:
-    """Ориентировочная цена по координатам и классу"""
     car = order.get("car")
     if not car:
         return None
@@ -108,8 +114,14 @@ def estimate_price(order: dict) -> int | None:
     if not (c1 and c2):
         return None
     dist = haversine_km(c1[0], c1[1], c2[0], c2[1])
-    rough = int(round(BASE_FEE + dist * rate, -1))  # округлим до десятков
+    rough = int(round(BASE_FEE + dist * rate, -1))
     return max(rough, BASE_FEE)
+
+def calc_amount(order: dict) -> int:
+    est = estimate_price(order)
+    if est:
+        return est
+    return HOURLY_INT.get(order.get("car"), 3500)
 
 def ensure_csv(path: str, header: list[str]):
     if not os.path.exists(path):
@@ -185,7 +197,7 @@ def car_choice_kb():
     ]
     return InlineKeyboardMarkup(rows)
 
-def pay_button(order_id: str, amount: int):
+def pay_keyboard(order_id: str, amount: int):
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton(f"Оплатить {amount} ₽", callback_data=f"pay:{order_id}:{amount}")]]
     )
@@ -290,17 +302,6 @@ async def vipcard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ====================== ОПЛАТА (ДЕМО) =====================
-def pay_keyboard(order_id: str, amount: int):
-    return InlineKeyboardMarkup([[InlineKeyboardButton(f"Оплатить {amount} ₽", callback_data=f"pay:{order_id}:{amount}")]])
-
-async def pay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    order_id = str(uuid4())[:8]
-    amount = 3500
-    await update.message.reply_text(
-        f"💳 Оплата заказа #{order_id}\nСумма: {amount} ₽\nУслуга: Подача {BRAND_NAME}",
-        reply_markup=pay_keyboard(order_id, amount)
-    )
-
 async def on_pay_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -315,6 +316,15 @@ async def on_pay_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e:
             log.warning(f"Admin notify failed: {e}")
+
+async def pay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    o = context.user_data.get("order", {})
+    order_id = str(uuid4())[:8]
+    amount = calc_amount(o) if o else 3500
+    await update.message.reply_text(
+        f"💳 Оплата заказа #{order_id}\nСумма: {amount} ₽\nУслуга: Подача {BRAND_NAME}",
+        reply_markup=pay_keyboard(order_id, amount)
+    )
 
 # ====================== ОФОРМЛЕНИЕ ЗАКАЗА =================
 def class_caption(car_name: str) -> str:
@@ -424,7 +434,8 @@ async def order_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.warning(f"Admin notify failed: {e}")
 
     await update.message.reply_text("Заказ принят. Водитель свяжется с вами.")
-    order_id, amount = str(uuid4())[:8], 3500
+    order_id = str(uuid4())[:8]
+    amount = calc_amount(o)
     await update.message.reply_text(
         f"Сумма к оплате — {amount} ₽.",
         reply_markup=pay_keyboard(order_id, amount)
@@ -437,35 +448,24 @@ async def order_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Оформление отменено.")
     return ConversationHandler.END
 
-# ====================== ГЕОЛОКАЦИЯ (УЛУЧШЕННО) =============
-async def on_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ========= ГЕОЛОКАЦИЯ ВНУТРИ КОНВЕРСАЦИИ (исправление) ====
+async def order_pickup_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
     loc = update.message.location
-    if not loc:
-        return
     lat, lon = loc.latitude, loc.longitude
-    maps = f"https://maps.google.com/?q={lat:.6f},{lon:.6f}"
+    context.user_data["order"]["pickup"] = f"{lat:.6f},{lon:.6f}"
+    await update.message.reply_text(
+        "📍 Точка подачи сохранена.\nТеперь укажите адрес назначения "
+        "или отправьте геолокацию места назначения."
+    )
+    return DROP
 
-    order = context.user_data.get("order")
-
-    # если заказ не начат — считаем локацию подачей
-    if not order:
-        context.user_data["order"] = {"paid": 0, "pickup": f"{lat:.6f},{lon:.6f}"}
-        await update.message.reply_text(
-            f"📍 Локация подачи сохранена.\n{maps}\n\nТеперь укажите адрес назначения "
-            f"или отправьте вторую геолокацию."
-        )
-        return DROP
-
-    # если есть подача, но нет назначения — это назначение
-    if "pickup" in order and "drop" not in order:
-        order["drop"] = f"{lat:.6f},{lon:.6f}"
-        await update.message.reply_text(
-            f"🎯 Локация назначения сохранена.\n{maps}\n\nКогда подать автомобиль?"
-        )
-        return WHEN
-
-    # если обе точки уже есть — просто подтверждаем
-    await update.message.reply_text("✅ Локация получена и сохранена.")
+async def order_drop_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    loc = update.message.location
+    lat, lon = loc.latitude, lon = loc.latitude, loc.longitude
+    context.user_data["order"]["drop"] = f"{lat:.6f},{lon:.6f}"
+    await update.message.reply_text("🎯 Точка назначения сохранена.\nВыберите класс автомобиля:",
+                                    reply_markup=car_choice_kb())
+    return CAR_CLASS
 
 # ====================== ТЕКСТЫ ИЗ МЕНЮ ====================
 async def on_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -484,7 +484,7 @@ async def on_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await vipcard_cmd(update, context)
     return await start(update, context)
 
-# ====================== РЕГИСТРАЦИЯ ХЭНДЛЕРОВ =============
+# ====================== РЕГИСТРАЦИЯ =======================
 def build_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -532,8 +532,14 @@ def build_app() -> Application:
     order_conv = ConversationHandler(
         entry_points=[CommandHandler("order", order_start)],
         states={
-            PICKUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_pickup)],
-            DROP: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_drop)],
+            PICKUP: [
+                MessageHandler(filters.LOCATION, order_pickup_location),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, order_pickup),
+            ],
+            DROP: [
+                MessageHandler(filters.LOCATION, order_drop_location),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, order_drop),
+            ],
             CAR_CLASS: [CallbackQueryHandler(on_car_choice, pattern=r"^car:")],
             WHEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_when)],
             PASSENGERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_passengers)],
@@ -544,9 +550,6 @@ def build_app() -> Application:
         allow_reentry=True,
     )
     app.add_handler(order_conv)
-
-    # Геолокация
-    app.add_handler(MessageHandler(filters.LOCATION, on_location))
 
     # Callback-кнопки
     app.add_handler(CallbackQueryHandler(on_car_choice, pattern=r"^car:"))
