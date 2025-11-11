@@ -49,17 +49,19 @@ PRICES = {
 
 # ---------- GOOGLE SHEETS ----------
 # Требуется Railway variable GOOGLE_APPLICATION_CREDENTIALS_JSON со всем JSON ключом
-import gspread
 from google.oauth2.service_account import Credentials
+import gspread
 
 credentials_info = json.loads(os.environ["GOOGLE_APPLICATION_CREDENTIALS_JSON"])
 credentials = Credentials.from_service_account_info(
     credentials_info,
-    scopes=["https://www.googleapis.com/auth/spreadsheets"],
+    scopes=[
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"  # <-- добавили Drive
+    ],
 )
 gc = gspread.authorize(credentials)
 sheet = gc.open("orders").sheet1  # таблица: orders -> Лист1
-
 def save_order_to_sheet(order: dict) -> None:
     """Запись подтверждённого заказа в Google Sheets."""
     try:
