@@ -1,19 +1,11 @@
 # -*- coding: utf-8 -*-
+# VIP Taxi Bot — минимальный, без картинок, с Google Sheets
+
 import os
 import json
-from google.oauth2.service_account import Credentials
-import gspread
-
-# Загружаем ключ из переменной Railway
-credentials_info = json.loads(os.environ["GOOGLE_APPLICATION_CREDENTIALS_JSON"])
-credentials = Credentials.from_service_account_info(
-    credentials_info,
-    scopes=["https://www.googleapis.com/auth/spreadsheets"]
-)
-
-# Авторизация и подключение к Google Sheets
-gc = gspread.authorize(credentials)
-sheet = gc.open("orders").sheet1
+import logging
+from uuid import uuid4
+from datetime import datetime
 
 from telegram import (
     Update,
@@ -21,7 +13,6 @@ from telegram import (
     KeyboardButton,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    LabeledPrice,
     BotCommand,
 )
 from telegram.constants import ParseMode
@@ -31,31 +22,23 @@ from telegram.ext import (
     MessageHandler,
     ConversationHandler,
     CallbackQueryHandler,
-    PreCheckoutQueryHandler,
     ContextTypes,
-    Defaults,
     filters,
 )
 
-# ====================== НАСТРОЙКИ ==========================
-BRAND_NAME = "VIP taxi"
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# ---------- ЛОГИ ----------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger("vip_taxi_bot")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is required")
+# ---------- НАСТРОЙКИ ----------
+BRAND_NAME = "VIP taxi"
 
-# Google Sheets
-SHEET_ID = os.getenv("SHEET_ID", "")
-GOOGLE_SERVICE_JSON = os.getenv("GOOGLE_SERVICE_JSON", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")  # строка или число — не важно
+assert BOT_TOKEN, "BOT_TOKEN is required"
 
-# Чат/канал водителей (группа/канал): пример -1001234567890
-DRIVERS_CHANNEL_ID = os.getenv("DRIVERS_CHANNEL_ID", "")
-
-# Тарифы (часовые для вывода)
-PRICES_STR = {
+# Тарифы (примерная цена/час)
+PRICES = {
     "Maybach W223": "7000 ₽/ч",
     "Maybach W222": "4000 ₽/ч",
     "S-Class W223": "5000 ₽/ч",
@@ -64,501 +47,326 @@ PRICES_STR = {
     "Minivan": "3000 ₽/ч",
 }
 
-# Фотки автопарка (нейтральные Unsplash)
-CAR_PHOTOS = {
-    "S-Class W222": "https://images.unsplash.com/photo-1615732045871-8db6d1dc8723",
-    "Maybach W222": "https://images.unsplash.com/photo-1624784194858-4e1cb2e54c56",
-    "S-Class W223": "https://images.unsplash.com/photo-1649254362283-5c9b83a3d31f",
-    "Maybach W223": "https://images.unsplash.com/photo-1650659020204-3d8e60d2dcbb",
-    "Business": "https://images.unsplash.com/photo-1606813902915-5c2b66f04e8e",
-    "Minivan": "https://images.unsplash.com/photo-1618401471383-5e00764f9a72",
-}
-CAR_DESCR = {
-    "S-Class W222": "Mercedes-Benz S-Class (W222). Салфетки, вода, зарядки.",
-    "Maybach W222": "Mercedes-Maybach (W222). Индивидуальные кресла; вода, зарядки.",
-    "S-Class W223": "Mercedes-Benz S-Class (W223). Новое поколение; вода, зарядки.",
-    "Maybach W223": "Mercedes-Maybach (W223). Флагман; вода, зарядки.",
-    "Business": "Mercedes E-Class / BMW 5. Комфорт, вода, зарядки.",
-    "Minivan": "Mercedes V-Class. До 6 пассажиров; вода, зарядки.",
-}
+# ---------- GOOGLE SHEETS ----------
+# Требуется Railway variable GOOGLE_APPLICATION_CREDENTIALS_JSON со всем JSON ключом
+import gspread
+from google.oauth2.service_account import Credentials
 
-# Параметры оценки цены по расстоянию
-BASE_PER_KM = int(os.getenv("BASE_PER_KM", "70"))
-START_FEE   = int(os.getenv("START_FEE", "500"))
+credentials_info = json.loads(os.environ["GOOGLE_APPLICATION_CREDENTIALS_JSON"])
+credentials = Credentials.from_service_account_info(
+    credentials_info,
+    scopes=["https://www.googleapis.com/auth/spreadsheets"],
+)
+gc = gspread.authorize(credentials)
+sheet = gc.open("orders").sheet1  # таблица: orders -> Лист1
 
-# Платежи
-PAYMENTS_PROVIDER_TOKEN = os.getenv("PAYMENTS_PROVIDER_TOKEN", "")
-
-# ИИ
-LLM_API_KEY = os.getenv("LLM_API_KEY", "")
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
-
-# ====================== УТИЛИТЫ ===========================
-def haversine_km(lat1, lon1, lat2, lon2):
-    R = 6371.0
-    to_rad = math.pi / 180
-    dlat = (lat2 - lat1) * to_rad
-    dlon = (lon2 - lon1) * to_rad
-    a = (math.sin(dlat/2)**2 +
-         math.cos(lat1*to_rad) * math.cos(lat2*to_rad) * math.sin(dlon/2)**2)
-    return 2 * R * math.asin(math.sqrt(a))
-
-def estimate_price_km(distance_km: float, car_class: str) -> int:
-    mult = {
-        "Maybach W223": 2.5,
-        "Maybach W222": 2.0,
-        "S-Class W223": 2.0,
-        "S-Class W222": 1.6,
-        "Business": 1.2,
-        "Minivan": 1.6,
-    }.get(car_class, 1.0)
-    return int(START_FEE + max(1.0, distance_km) * BASE_PER_KM * mult)
-
-def gsheet():
-    if not (SHEET_ID and GOOGLE_SERVICE_JSON):
-        raise RuntimeError("SHEET_ID/GOOGLE_SERVICE_JSON are required for Google Sheets")
-    scopes = ['https://spreadsheets.google.com/feeds','https://www.googleapis.com/auth/drive']
-    info = json.loads(GOOGLE_SERVICE_JSON)
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(info, scopes)
-    gc = gspread.authorize(creds)
-    return gc.open_by_key(SHEET_ID)
-
-def order_id():
-    return hex(int(time.time()))[2:]
-
-def class_caption(car_name: str) -> str:
-    return f"{car_name}\n{CAR_DESCR.get(car_name,'')}\n{PRICES_STR.get(car_name,'')}"
-
-def pay_keyboard(order_id_: str, amount: int):
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(f"Оплатить {amount} ₽", callback_data=f"pay:{order_id_}:{amount}")]]
-    )
-
-# ====================== ИИ ================================
-def llm_chat(prompt: str, user_id: int) -> str:
-    if not LLM_API_KEY:
-        return ("❗️ ИИ недоступен: администратору нужно добавить переменную "
-                "LLM_API_KEY в Railway.")
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
-    system = (
-        "Ты ассистент VIP-такси. Отвечай кратко и по делу. "
-        "Если просят оформить поездку — предложи /order. Поддерживай RU/EN."
-    )
-    data = {
-        "model": LLM_MODEL,
-        "messages": [{"role": "system", "content": system},
-                     {"role": "user", "content": prompt}],
-        "temperature": 0.2,
-    }
+def save_order_to_sheet(order: dict) -> None:
+    """Запись подтверждённого заказа в Google Sheets."""
     try:
-        r = requests.post(url, headers=headers, json=data, timeout=30)
-        if r.status_code != 200:
-            return f"Ошибка LLM: {r.status_code} — {r.text}"
-        return r.json()["choices"][0]["message"]["content"].strip()
+        sheet.append_row(
+            [
+                order.get("order_id"),
+                order.get("user_id"),
+                order.get("username"),
+                order.get("pickup"),
+                order.get("destination"),
+                order.get("car_class"),
+                order.get("time"),
+                order.get("passengers"),
+                order.get("contact"),
+                order.get("approx_price"),
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            ],
+            value_input_option="USER_ENTERED",
+        )
+        log.info("Заказ записан в Google Sheets")
     except Exception as e:
-        return f"Ошибка LLM: {e}"
+        log.error("Ошибка Google Sheets: %s", e)
 
-# ====================== КЛАВИАТУРЫ ========================
-def main_menu():
+# ---------- КОНСТАНТЫ СОСТОЯНИЙ ----------
+PICKUP, DEST, CAR, TIME, PAX, CONTACT, CONFIRM = range(7)
+
+# ---------- ВСПОМОГАТЕЛЬНОЕ ----------
+def main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("🛎 Заказ"), KeyboardButton("🚗 Автопарк")],
-            [KeyboardButton("💳 Оплата"), KeyboardButton("📞 Контакты")],
-            [KeyboardButton("⭐ Отзыв"), KeyboardButton("🪪 VIP-карта")],
-            [KeyboardButton("🤖 ИИ-помощник"), KeyboardButton("📍 Геолокация", request_location=True)],
+            ["🔔 Заказ", "💰 Тарифы"],
+            ["📌 Статус", "☎️ Контакт"],
+            ["❌ Отмена"],
         ],
         resize_keyboard=True,
     )
 
-def car_choice_kb():
+def cars_kb() -> ReplyKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton("S-Class W222", callback_data="car:S-Class W222"),
-         InlineKeyboardButton("Maybach W222", callback_data="car:Maybach W222")],
-        [InlineKeyboardButton("S-Class W223", callback_data="car:S-Class W223"),
-         InlineKeyboardButton("Maybach W223", callback_data="car:Maybach W223")],
-        [InlineKeyboardButton("Business", callback_data="car:Business"),
-         InlineKeyboardButton("Minivan", callback_data="car:Minivan")],
+        ["Maybach W223", "Maybach W222"],
+        ["S-Class W223", "S-Class W222"],
+        ["Business", "Minivan"],
+        ["❌ Отмена"],
     ]
-    return InlineKeyboardMarkup(rows)
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=True)
 
-# ====================== СОСТОЯНИЯ =========================
-PICKUP, DROP, CAR_CLASS, WHEN, PASSENGERS, CONTACT, CONFIRM = range(7)
-FEEDBACK_RATING, FEEDBACK_TEXT = range(2)
-AI_CHAT = 99
+def price_text() -> str:
+    lines = ["<b>Тарифы (примерно):</b>"]
+    for k, v in PRICES.items():
+        lines.append(f"• {k}: {v}")
+    lines.append("\nМинимум 1 час. Точная стоимость зависит от маршрута и времени.")
+    return "\n".join(lines)
 
-# ====================== КОМАНДЫ ===========================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (
-        f"<b>Добро пожаловать в {BRAND_NAME}</b>\n"
-        "Ваш комфорт — наш приоритет.\n\n"
-        "Выберите действие в меню ниже.\n"
-        "Или отправьте геолокацию — подача по вашей точке."
+def to_maps_link(lat: float, lon: float) -> str:
+    return f"https://maps.google.com/?q={lat},{lon}"
+
+def approx_for_class(car_class: str) -> str:
+    return PRICES.get(car_class, "По запросу")
+
+# ---------- КОМАНДЫ ----------
+async def set_commands(app: Application) -> None:
+    await app.bot.set_my_commands(
+        [
+            BotCommand("start", "Запустить бота"),
+            BotCommand("menu", "Показать меню"),
+            BotCommand("order", "Сделать заказ"),
+            BotCommand("price", "Тарифы"),
+            BotCommand("status", "Статус заказа"),
+            BotCommand("contact", "Связаться с диспетчером"),
+            BotCommand("cancel", "Отмена"),
+        ]
     )
-    await (update.message or update.callback_query.message).reply_text(txt, reply_markup=main_menu())
 
-async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        f"Добро пожаловать в <b>{BRAND_NAME}</b>.\n"
+        "Ваш комфорт — наш приоритет.\n\n"
+        "Выберите действие в меню ниже или отправьте геолокацию — подача по вашей точке.",
+        reply_markup=main_menu_kb(),
+        parse_mode=ParseMode.HTML,
+    )
+
+async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await start(update, context)
 
-async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lines = ["<b>Тарифы:</b>"]
-    for k, v in PRICES_STR.items():
-        lines.append(f"• {k}: {v}")
-    lines.append("\nОпции: ожидание, встреча с табличкой, детское кресло — по запросу.")
-    await update.message.reply_text("\n".join(lines))
+async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(price_text(), parse_mode=ParseMode.HTML)
 
-async def fleet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    for cls in ["S-Class W222","Maybach W222","S-Class W223","Maybach W223","Business","Minivan"]:
-        url = CAR_PHOTOS[cls]
-        caption = class_caption(cls)
-        try:
-            await update.message.reply_photo(photo=url, caption=caption)
-        except Exception:
-            await update.message.reply_text(caption)
-
-async def contact_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Позвонить", url="tel:+7XXXXXXXXXX")]])
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Диспетчер: пишите здесь — ответим в чате.\nРезервный номер: <code>+7 XXX XXX-XX-XX</code>",
-        reply_markup=kb
+        "Укажите номер заказа или дату — проверим статус и вернёмся к вам.",
+        reply_markup=main_menu_kb(),
     )
 
-# ---------- ИИ ----------
-async def ask_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 ИИ-помощник включён. Напишите вопрос.\nВыход — /cancel.")
-    return AI_CHAT
-
-async def ask_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.message.text.strip()
-    await update.message.reply_text(llm_chat(q, update.effective_user.id))
-    return AI_CHAT
-
-# ---------- Отзывы ----------
-async def feedback_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Оцените поездку от 1 до 5.")
-    return FEEDBACK_RATING
-
-async def feedback_rating(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = update.message.text.strip()
-    if not txt.isdigit() or not (1 <= int(txt) <= 5):
-        await update.message.reply_text("Введите число от 1 до 5.")
-        return FEEDBACK_RATING
-    context.user_data["feedback_rating"] = int(txt)
-    await update.message.reply_text("Оставьте короткий комментарий.")
-    return FEEDBACK_TEXT
-
-async def feedback_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    comment = update.message.text.strip()
-    rating = context.user_data.pop("feedback_rating", 5)
-    try:
-        with open("feedback.csv", "a", newline="", encoding="utf-8") as f:
-            w = csv.writer(f); 
-            if f.tell() == 0:
-                w.writerow(["ts","user_id","username","rating","comment"])
-            w.writerow([datetime.utcnow().isoformat(), update.effective_user.id, update.effective_user.username, rating, comment])
-    except Exception as e:
-        log.warning(f"feedback save error: {e}")
-    await update.message.reply_text("Спасибо. Мы ценим ваше мнение.")
-    return ConversationHandler.END
-
-async def feedback_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Отзыв отменён.")
-    return ConversationHandler.END
-
-# ====================== ОФОРМЛЕНИЕ ЗАКАЗА =================
-def _set_order(o, key, val): o[key] = val; return o
-
-async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["order"] = {"order_id": order_id()}
+async def contact_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Укажите <b>адрес подачи</b> или отправьте геолокацию кнопкой «📍 Геолокация».",
+        "Диспетчер: пишите здесь — ответим в чате.\nРезервный номер: +7 XXX XXX-XX-XX",
+        reply_markup=main_menu_kb(),
+    )
+
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.clear()
+    await update.message.reply_text("Отмена. Чем могу помочь ещё?", reply_markup=main_menu_kb())
+    return ConversationHandler.END
+
+# ---------- ЗАКАЗ (CONVERSATION) ----------
+async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["order"] = {
+        "order_id": uuid4().hex[:8],
+        "user_id": update.effective_user.id,
+        "username": f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.full_name,
+    }
+    kb = ReplyKeyboardMarkup(
+        [[KeyboardButton("Отправить мою геолокацию", request_location=True)], ["❌ Отмена"]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await update.message.reply_text(
+        "Укажите адрес подачи или отправьте свою геолокацию кнопкой ниже.",
+        reply_markup=kb,
     )
     return PICKUP
 
-async def order_pickup_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    o = _set_order(context.user_data.setdefault("order", {}), "pickup", update.message.text.strip())
-    await update.message.reply_text("Укажите <b>адрес назначения</b> или отправьте геолокацию.")
-    return DROP
-
-async def order_pickup_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def pickup_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     loc = update.message.location
-    o = context.user_data.setdefault("order", {})
-    o["pickup"] = f"{loc.latitude:.6f},{loc.longitude:.6f}"
-    o["pickup_lat"], o["pickup_lon"] = loc.latitude, loc.longitude
-    await update.message.reply_text("✅ Локация подачи принята.\nТеперь укажите <b>адрес назначения</b> или отправьте геолокацию.")
-    return DROP
+    link = to_maps_link(loc.latitude, loc.longitude)
+    context.user_data["order"]["pickup"] = link
+    await update.message.reply_text("Точка подачи получена.\n📍 Отправьте адрес назначения.", reply_markup=ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True))
+    return DEST
 
-async def order_drop_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _set_order(context.user_data["order"], "drop", update.message.text.strip())
-    await update.message.reply_text("🚗 Выберите класс авто:", reply_markup=ReplyKeyboardMarkup(
-        [["Maybach W223","Maybach W222"],["S-Class W223","S-Class W222"],["Business","Minivan"]],
-        resize_keyboard=True
-    ))
-    return CAR_CLASS
+async def text_pickup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["order"]["pickup"] = update.message.text.strip()
+    await update.message.reply_text("Укажите адрес назначения.", reply_markup=ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True))
+    return DEST
 
-async def order_drop_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def dest_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     loc = update.message.location
-    o = context.user_data["order"]
-    o["drop"] = f"{loc.latitude:.6f},{loc.longitude:.6f}"
-    o["drop_lat"], o["drop_lon"] = loc.latitude, loc.longitude
-    await update.message.reply_text("🚗 Выберите класс авто:", reply_markup=ReplyKeyboardMarkup(
-        [["Maybach W223","Maybach W222"],["S-Class W223","S-Class W222"],["Business","Minivan"]],
-        resize_keyboard=True
-    ))
-    return CAR_CLASS
+    context.user_data["order"]["destination"] = to_maps_link(loc.latitude, loc.longitude)
+    await update.message.reply_text("Выберите класс авто.", reply_markup=cars_kb())
+    return CAR
 
-async def on_car_choice_inline(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    _, car = q.data.split(":", 1)
-    context.user_data["order"]["car"] = car
-    caption = class_caption(car)
-    url = CAR_PHOTOS.get(car)
-    try:
-        await q.message.reply_photo(photo=url, caption=caption)
-    except Exception:
-        await q.message.reply_text(caption)
-    await q.message.reply_text("⏰ Когда подать автомобиль? (например: сейчас / 19:30 / завтра 10:00)")
-    return WHEN
+async def text_dest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["order"]["destination"] = update.message.text.strip()
+    await update.message.reply_text("Выберите класс авто.", reply_markup=cars_kb())
+    return CAR
 
-async def on_car_choice_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cls = update.message.text.strip()
-    context.user_data["order"]["car"] = cls
-    await update.message.reply_text("⏰ Когда подать автомобиль? (например: сейчас / 19:30 / завтра 10:00)")
-    return WHEN
+async def car_choose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    car = update.message.text.strip()
+    if car not in PRICES:
+        await update.message.reply_text("Пожалуйста, выберите тариф кнопкой.", reply_markup=cars_kb())
+        return CAR
+    context.user_data["order"]["car_class"] = car
+    context.user_data["order"]["approx_price"] = approx_for_class(car)
+    await update.message.reply_text(
+        "⏰ Когда подать автомобиль? (например: сейчас, 19:30, завтра 10:00)",
+        reply_markup=ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True),
+    )
+    return TIME
 
-async def order_when(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["order"]["when"] = update.message.text.strip()
-    await update.message.reply_text("👥 Сколько пассажиров?")
-    return PASSENGERS
+async def time_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["order"]["time"] = update.message.text.strip()
+    await update.message.reply_text(
+        "Сколько пассажиров?",
+        reply_markup=ReplyKeyboardMarkup([["1", "2", "3", "4", "5", "6"], ["❌ Отмена"]], resize_keyboard=True),
+    )
+    return PAX
 
-async def order_passengers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def pax_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["order"]["passengers"] = update.message.text.strip()
-    await update.message.reply_text("☎️ Оставьте контакт (имя и телефон):")
+    kb = ReplyKeyboardMarkup(
+        [[KeyboardButton("Поделиться телефоном", request_contact=True)], ["❌ Отмена"]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await update.message.reply_text("Оставьте контакт (имя и телефон), или поделитесь номером:", reply_markup=kb)
     return CONTACT
 
-async def order_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def contact_from_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    c = update.message.contact
+    phone = c.phone_number
+    name = f"{c.first_name or ''} {c.last_name or ''}".strip()
+    context.user_data["order"]["contact"] = f"{name} {phone}".strip()
+    return await confirm_order(update, context)
+
+async def contact_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["order"]["contact"] = update.message.text.strip()
+    return await confirm_order(update, context)
+
+async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     o = context.user_data["order"]
-    o["contact"] = update.message.text.strip()
-
-    # Расстояние (если есть обе геоточки)
-    dist = 8.0
-    if all(k in o for k in ("pickup_lat","pickup_lon","drop_lat","drop_lon")):
-        dist = round(haversine_km(o["pickup_lat"], o["pickup_lon"], o["drop_lat"], o["drop_lon"]), 1)
-    o["distance_km"] = dist
-
-    # Оценка
-    o["est_price"] = estimate_price_km(dist, o.get("car", "Business"))
-
-    summary = (
-        f"<b>Проверьте заказ:</b>\n"
+    text = (
+        "<b>Проверьте заказ:</b>\n"
         f"• Подача: {o.get('pickup')}\n"
-        f"• Назначение: {o.get('drop')}\n"
-        f"• Класс: {o.get('car')}\n"
-        f"• Расстояние: ~{o['distance_km']} км\n"
-        f"• Оценка: ~{o['est_price']} ₽\n"
-        f"• Время: {o.get('when')}\n"
+        f"• Назначение: {o.get('destination')}\n"
+        f"• Класс авто: {o.get('car_class')}  (≈ {o.get('approx_price')})\n"
+        f"• Время: {o.get('time')}\n"
         f"• Пассажиров: {o.get('passengers')}\n"
         f"• Контакт: {o.get('contact')}\n\n"
-        f"Если всё верно — напишите «Подтверждаю». Для отмены — /cancel."
+        "Если всё верно — нажмите «Подтверждаю». Для отмены — «Отмена»."
     )
-    await update.message.reply_text(summary)
+    kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("✅ Подтверждаю", callback_data="confirm"),
+          InlineKeyboardButton("❌ Отмена", callback_data="cancel")]]
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
     return CONFIRM
 
-async def order_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.text.lower().startswith("подтвержда"):
-        await update.message.reply_text("Напишите «Подтверждаю» или используйте /cancel.")
-        return CONFIRM
+async def confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+    if data == "cancel":
+        context.user_data.clear()
+        await q.edit_message_text("Отменено. Чем ещё помочь?")
+        return ConversationHandler.END
 
-    o = context.user_data["order"]
-    # Запись в Google Sheets
+    # подтверждение
+    order = context.user_data["order"]
+    save_order_to_sheet(order)
+
+    # Сообщение пользователю
+    await q.edit_message_text("Заказ принят. Водитель свяжется с вами.")
+    # Дублируем диспетчеру
     try:
-        sh = gsheet()
-        w  = sh.worksheet("Orders")
-        w.append_row([
-            o.get("order_id",""), datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-            str(update.effective_chat.id), o.get("contact",""),
-            o.get("pickup",""), o.get("drop",""),
-            o.get("car",""), o.get("distance_km",0),
-            o.get("est_price",0), "new", "", "",
-            o.get("when",""), o.get("passengers","")
-        ])
-    except Exception as e:
-        log.warning(f"Sheets error: {e}")
-        if ADMIN_CHAT_ID:
-            try: await context.bot.send_message(ADMIN_CHAT_ID, f"Sheets error: {e}")
-            except: pass
+        admin_id = int(ADMIN_CHAT_ID) if ADMIN_CHAT_ID else None
+    except ValueError:
+        admin_id = ADMIN_CHAT_ID
 
-    # Сообщение в служебный чат водителей
-    if DRIVERS_CHANNEL_ID:
-        txt = (f"🆕 <b>Новый заказ</b> #{o.get('order_id','')}\n"
-               f"• Подача: {o.get('pickup','')}\n"
-               f"• Назначение: {o.get('drop','')}\n"
-               f"• Класс: {o.get('car','')}\n"
-               f"• Расстояние: ~{o.get('distance_km',0)} км\n"
-               f"• Оценка: ~{o.get('est_price',0)} ₽\n"
-               f"• Время: {o.get('when','')}\n"
-               f"• Пассажиров: {o.get('passengers','')}")
+    if admin_id:
+        txt = (
+            f"🆕 <b>Новый заказ</b>\n"
+            f"От: {order.get('username')} (ID {order.get('user_id')})\n"
+            f"📍 Подача: {order.get('pickup')}\n"
+            f"🏁 Назначение: {order.get('destination')}\n"
+            f"🚘 Класс: {order.get('car_class')}  (≈ {order.get('approx_price')})\n"
+            f"⏰ Время: {order.get('time')}\n"
+            f"👥 Пассажиров: {order.get('passengers')}\n"
+            f"☎️ Контакт: {order.get('contact')}\n"
+            f"№ {order.get('order_id')}"
+        )
         try:
-            await context.bot.send_message(int(DRIVERS_CHANNEL_ID), txt, parse_mode="HTML")
+            await context.bot.send_message(admin_id, txt, parse_mode=ParseMode.HTML)
         except Exception as e:
-            log.warning(f"Driver alert error: {e}")
-            if ADMIN_CHAT_ID:
-                try: await context.bot.send_message(ADMIN_CHAT_ID, f"Driver alert error: {e}")
-                except: pass
+            log.error("Не удалось отправить админу: %s", e)
 
-    await update.message.reply_text("✅ Заказ принят. Водитель свяжется с вами.")
-
-    # Оплата: если провайдер не задан — демо-кнопка. Иначе — Telegram Payments.
-    amount = int(o.get("est_price", 3500))
-    oid = str(uuid4())[:8]
-    if not PAYMENTS_PROVIDER_TOKEN:
-        await update.message.reply_text(
-            f"Сумма к оплате — {amount} ₽.", reply_markup=pay_keyboard(oid, amount)
-        )
-    else:
-        title = f"Поездка {o.get('car','')}"
-        desc  = f"Оценка: ~{amount} ₽. Итог зависит от фактического маршрута."
-        await update.message.bot.send_invoice(
-            chat_id=update.effective_chat.id,
-            title=title, description=desc, payload=json.dumps({"order_id": o.get("order_id","")}),
-            provider_token=PAYMENTS_PROVIDER_TOKEN, currency="RUB",
-            prices=[LabeledPrice("Поездка", amount*100)]
-        )
-
-    context.user_data["order"] = {}
+    context.user_data.clear()
     return ConversationHandler.END
 
-async def order_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["order"] = {}
-    await update.message.reply_text("Оформление отменено ✅", reply_markup=main_menu())
-    return ConversationHandler.END
-
-# ---------- Оплата (демо-кнопка callback) ----------
-async def on_pay_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    _, order_id_, amount = q.data.split(":")
-    await q.edit_message_text(f"✅ Оплата заказа #{order_id_} на {amount} ₽ выполнена (демо).")
-
-# ---------- Telegram Payments ----------
-async def precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.pre_checkout_query.answer(ok=True)
-
-async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Оплата получена. Спасибо!", reply_markup=main_menu())
-
-# ====================== ТЕКСТЫ МЕНЮ =======================
-async def on_text_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (update.message.text or "").lower()
-    if "заказ" in txt:
-        return await order_start(update, context)
-    if "автопарк" in txt:
-        return await fleet_cmd(update, context)
-    if "оплата" in txt:
-        # запустим оплату по текущему заказу, если он есть
-        o = context.user_data.get("order")
-        if o and "est_price" in o:
-            amount = int(o["est_price"])
-            await update.message.reply_text(
-                f"Сумма к оплате — {amount} ₽.",
-                reply_markup=pay_keyboard(str(uuid4())[:8], amount)
-            )
-        else:
-            await update.message.reply_text("Оформите заказ — и я посчитаю сумму к оплате.")
-        return
-    if "контакт" in txt:
-        return await contact_cmd(update, context)
-    if "отзыв" in txt:
-        return await feedback_start(update, context)
-    if "vip" in txt or "карта" in txt:
-        uid = update.effective_user.id
-        await update.message.reply_text(f"🪪 VIP Card\nID: {uid}\nСтатус: Premium")
-        return
-    if "ии" in txt or "помощник" in txt:
-        return await ask_start(update, context)
-    return await start(update, context)
-
-# ====================== РЕГИСТРАЦИЯ =======================
+# ---------- РОУТИНГ ----------
 def build_app() -> Application:
-    app = Application.builder().token(BOT_TOKEN).defaults(
-        Defaults(parse_mode=ParseMode.HTML)
-    ).build()
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    async def set_commands(app_):
-        cmds = [
-            BotCommand("start", "начать и меню"),
-            BotCommand("order", "оформить заказ"),
-            BotCommand("price", "тарифы"),
-            BotCommand("fleet", "автопарк"),
-            BotCommand("ask", "включить ИИ-помощника"),
-            BotCommand("contact", "контакты"),
-            BotCommand("feedback", "оставить отзыв"),
-            BotCommand("cancel", "отменить оформление"),
-        ]
-        await app_.bot.set_my_commands(cmds)
-    app.post_init = set_commands
-
-    # Заказ (Conversation)
-    order_conv = ConversationHandler(
-        entry_points=[CommandHandler("order", order_start),
-                      MessageHandler(filters.Regex("^🛎 Заказ$"), order_start)],
-        states={
-            PICKUP: [
-                MessageHandler(filters.LOCATION, order_pickup_location),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, order_pickup_text),
-            ],
-            DROP: [
-                MessageHandler(filters.LOCATION, order_drop_location),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, order_drop_text),
-            ],
-            CAR_CLASS: [
-                CallbackQueryHandler(on_car_choice_inline, pattern=r"^car:"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, on_car_choice_text),
-            ],
-            WHEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_when)],
-            PASSENGERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_passengers)],
-            CONTACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_contact)],
-            CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_confirm)],
-        },
-        fallbacks=[CommandHandler("cancel", order_cancel)],
-        allow_reentry=True,
-    )
-    app.add_handler(order_conv)
-
-    # Команды
+    # команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("price", price_cmd))
-    app.add_handler(CommandHandler("fleet", fleet_cmd))
+    app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("contact", contact_cmd))
-    app.add_handler(CommandHandler("feedback", feedback_start))
-    app.add_handler(CommandHandler("ask", ask_start))
+    app.add_handler(CommandHandler("cancel", cancel_cmd))
 
-    # ИИ диалог
-    ai_conv = ConversationHandler(
-        entry_points=[CommandHandler("ask", ask_start)],
-        states={ AI_CHAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_message)] },
-        fallbacks=[CommandHandler("cancel", order_cancel)],
+    # разговор заказов
+    conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("order", order_start),
+            MessageHandler(filters.Regex("^🔔 Заказ$"), order_start),
+        ],
+        states={
+            PICKUP: [
+                MessageHandler(filters.LOCATION, pickup_location),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, text_pickup),
+            ],
+            DEST: [
+                MessageHandler(filters.LOCATION, dest_location),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, text_dest),
+            ],
+            CAR: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, car_choose),
+            ],
+            TIME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, time_set),
+            ],
+            PAX: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, pax_set),
+            ],
+            CONTACT: [
+                MessageHandler(filters.CONTACT, contact_from_button),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, contact_text),
+            ],
+            CONFIRM: [
+                CallbackQueryHandler(confirm_cb, pattern="^(confirm|cancel)$"),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_cmd), MessageHandler(filters.Regex("^❌ Отмена$"), cancel_cmd)],
         allow_reentry=True,
     )
-    app.add_handler(ai_conv)
+    app.add_handler(conv)
 
-    # Оплата (демо-кнопка)
-    app.add_handler(CallbackQueryHandler(on_pay_click, pattern=r"^pay:"))
+    # Кнопки меню
+    app.add_handler(MessageHandler(filters.Regex("^💰 Тарифы$"), price_cmd))
+    app.add_handler(MessageHandler(filters.Regex("^📌 Статус$"), status_cmd))
+    app.add_handler(MessageHandler(filters.Regex("^☎️ Контакт$"), contact_cmd))
+    app.add_handler(MessageHandler(filters.Regex("^❌ Отмена$"), cancel_cmd))
 
-    # Telegram Payments
-    app.add_handler(PreCheckoutQueryHandler(precheckout))
-    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
-
-    # Тексты из меню
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_menu))
-
+    app.post_init = set_commands
     return app
 
-def main():
-    app = build_app()
-    log.info("Starting VIP taxi bot…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 if __name__ == "__main__":
-    main()
+    app = build_app()
+    log.info("Bot is starting…")
+    app.run_polling(close_loop=False)
