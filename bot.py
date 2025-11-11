@@ -1,10 +1,19 @@
 # -*- coding: utf-8 -*-
-import os, csv, math, time, json, logging, requests
-from uuid import uuid4
-from datetime import datetime
-
+import os
+import json
+from google.oauth2.service_account import Credentials
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+
+# Загружаем ключ из переменной Railway
+credentials_info = json.loads(os.environ["GOOGLE_APPLICATION_CREDENTIALS_JSON"])
+credentials = Credentials.from_service_account_info(
+    credentials_info,
+    scopes=["https://www.googleapis.com/auth/spreadsheets"]
+)
+
+# Авторизация и подключение к Google Sheets
+gc = gspread.authorize(credentials)
+sheet = gc.open("orders").sheet1
 
 from telegram import (
     Update,
