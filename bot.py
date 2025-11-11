@@ -1,4 +1,7 @@
 # -*- coding: utf-8 -*-
+import requests
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 import os
 import csv
 import math
