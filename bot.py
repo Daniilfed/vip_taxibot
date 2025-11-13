@@ -34,7 +34,7 @@ log = logging.getLogger("vip_taxi_bot")
 BRAND_NAME = "VIP taxi"
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")  # строка или число — не важно
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")  # ID группы водителей (например -1003446115764)
 assert BOT_TOKEN, "BOT_TOKEN is required"
 
 # Тарифы (примерная цена/час)
@@ -47,6 +47,10 @@ PRICES = {
     "Minivan": "3000 ₽/ч",
 }
 
+# Память бота для бронирования заказов водителями:
+# order_id -> dict(order_data + статус и водитель)
+ORDERS_CACHE: dict[str, dict] = {}
+
 # ---------- GOOGLE SHEETS ----------
 # Требуется Railway variable GOOGLE_APPLICATION_CREDENTIALS_JSON со всем JSON ключом
 from google.oauth2.service_account import Credentials
@@ -57,11 +61,13 @@ credentials = Credentials.from_service_account_info(
     credentials_info,
     scopes=[
         "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"  # <-- добавили Drive
+        "https://www.googleapis.com/auth/drive",  # доступ к таблице
     ],
 )
 gc = gspread.authorize(credentials)
 sheet = gc.open("orders").sheet1  # таблица: orders -> Лист1
+
+
 def save_order_to_sheet(order: dict) -> None:
     """Запись подтверждённого заказа в Google Sheets."""
     try:
@@ -85,6 +91,7 @@ def save_order_to_sheet(order: dict) -> None:
     except Exception as e:
         log.error("Ошибка Google Sheets: %s", e)
 
+
 # ---------- КОНСТАНТЫ СОСТОЯНИЙ ----------
 PICKUP, DEST, CAR, TIME, PAX, CONTACT, CONFIRM = range(7)
 
@@ -99,6 +106,7 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
         resize_keyboard=True,
     )
 
+
 def cars_kb() -> ReplyKeyboardMarkup:
     rows = [
         ["Maybach W223", "Maybach W222"],
@@ -108,6 +116,7 @@ def cars_kb() -> ReplyKeyboardMarkup:
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=True)
 
+
 def price_text() -> str:
     lines = ["<b>Тарифы (примерно):</b>"]
     for k, v in PRICES.items():
@@ -115,11 +124,14 @@ def price_text() -> str:
     lines.append("\nМинимум 1 час. Точная стоимость зависит от маршрута и времени.")
     return "\n".join(lines)
 
+
 def to_maps_link(lat: float, lon: float) -> str:
     return f"https://maps.google.com/?q={lat},{lon}"
 
+
 def approx_for_class(car_class: str) -> str:
     return PRICES.get(car_class, "По запросу")
+
 
 # ---------- КОМАНДЫ ----------
 async def set_commands(app: Application) -> None:
@@ -135,6 +147,7 @@ async def set_commands(app: Application) -> None:
         ]
     )
 
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"Добро пожаловать в <b>{BRAND_NAME}</b>.\n"
@@ -144,11 +157,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode=ParseMode.HTML,
     )
 
+
 async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await start(update, context)
 
+
 async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(price_text(), parse_mode=ParseMode.HTML)
+
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
@@ -156,16 +172,19 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         reply_markup=main_menu_kb(),
     )
 
+
 async def contact_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Диспетчер: пишите здесь — ответим в чате.\nРезервный номер: +7 XXX XXX-XX-XX",
         reply_markup=main_menu_kb(),
     )
 
+
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     await update.message.reply_text("Отмена. Чем могу помочь ещё?", reply_markup=main_menu_kb())
     return ConversationHandler.END
+
 
 # ---------- ЗАКАЗ (CONVERSATION) ----------
 async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -185,17 +204,26 @@ async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     )
     return PICKUP
 
+
 async def pickup_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     loc = update.message.location
     link = to_maps_link(loc.latitude, loc.longitude)
     context.user_data["order"]["pickup"] = link
-    await update.message.reply_text("Точка подачи получена.\n📍 Отправьте адрес назначения.", reply_markup=ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True))
+    await update.message.reply_text(
+        "Точка подачи получена.\n📍 Отправьте адрес назначения.",
+        reply_markup=ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True),
+    )
     return DEST
+
 
 async def text_pickup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["order"]["pickup"] = update.message.text.strip()
-    await update.message.reply_text("Укажите адрес назначения.", reply_markup=ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True))
+    await update.message.reply_text(
+        "Укажите адрес назначения.",
+        reply_markup=ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True),
+    )
     return DEST
+
 
 async def dest_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     loc = update.message.location
@@ -203,10 +231,12 @@ async def dest_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     await update.message.reply_text("Выберите класс авто.", reply_markup=cars_kb())
     return CAR
 
+
 async def text_dest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["order"]["destination"] = update.message.text.strip()
     await update.message.reply_text("Выберите класс авто.", reply_markup=cars_kb())
     return CAR
+
 
 async def car_choose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     car = update.message.text.strip()
@@ -221,6 +251,7 @@ async def car_choose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
     return TIME
 
+
 async def time_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["order"]["time"] = update.message.text.strip()
     await update.message.reply_text(
@@ -228,6 +259,7 @@ async def time_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         reply_markup=ReplyKeyboardMarkup([["1", "2", "3", "4", "5", "6"], ["❌ Отмена"]], resize_keyboard=True),
     )
     return PAX
+
 
 async def pax_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["order"]["passengers"] = update.message.text.strip()
@@ -239,6 +271,7 @@ async def pax_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Оставьте контакт (имя и телефон), или поделитесь номером:", reply_markup=kb)
     return CONTACT
 
+
 async def contact_from_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     c = update.message.contact
     phone = c.phone_number
@@ -246,9 +279,11 @@ async def contact_from_button(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data["order"]["contact"] = f"{name} {phone}".strip()
     return await confirm_order(update, context)
 
+
 async def contact_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["order"]["contact"] = update.message.text.strip()
     return await confirm_order(update, context)
+
 
 async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     o = context.user_data["order"]
@@ -263,11 +298,16 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         "Если всё верно — нажмите «Подтверждаю». Для отмены — «Отмена»."
     )
     kb = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("✅ Подтверждаю", callback_data="confirm"),
-          InlineKeyboardButton("❌ Отмена", callback_data="cancel")]]
+        [
+            [
+                InlineKeyboardButton("✅ Подтверждаю", callback_data="confirm"),
+                InlineKeyboardButton("❌ Отмена", callback_data="cancel"),
+            ]
+        ]
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
     return CONFIRM
+
 
 async def confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
@@ -280,35 +320,161 @@ async def confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     # подтверждение
     order = context.user_data["order"]
+
+    # сохраняем в Google Sheets
     save_order_to_sheet(order)
+
+    # кладём в кэш для водителей (без личных данных в тексте)
+    global ORDERS_CACHE
+    ORDERS_CACHE[order["order_id"]] = {
+        **order,
+        "status": "new",
+        "driver_id": None,
+        "driver_name": None,
+    }
 
     # Сообщение пользователю
     await q.edit_message_text("Заказ принят. Водитель свяжется с вами.")
-    # Дублируем диспетчеру
+
+    # Отправляем чистый заказ в группу водителей (без имени, телефона и tg-id)
     try:
         admin_id = int(ADMIN_CHAT_ID) if ADMIN_CHAT_ID else None
     except ValueError:
         admin_id = ADMIN_CHAT_ID
 
     if admin_id:
-        txt = (
-            f"🆕 <b>Новый заказ</b>\n"
-            f"От: {order.get('username')} (ID {order.get('user_id')})\n"
-            f"📍 Подача: {order.get('pickup')}\n"
-            f"🏁 Назначение: {order.get('destination')}\n"
+        text_for_drivers = (
+            f"🆕 Новый заказ #{order.get('order_id')}\n"
+            f"📍 Откуда: {order.get('pickup')}\n"
+            f"🏁 Куда: {order.get('destination')}\n"
             f"🚘 Класс: {order.get('car_class')}  (≈ {order.get('approx_price')})\n"
             f"⏰ Время: {order.get('time')}\n"
-            f"👥 Пассажиров: {order.get('passengers')}\n"
-            f"☎️ Контакт: {order.get('contact')}\n"
-            f"№ {order.get('order_id')}"
+            f"👥 Пассажиров: {order.get('passengers')}\n\n"
+            f"Личные данные клиента скрыты."
         )
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "🟢 Взять заказ", callback_data=f"drv_take:{order.get('order_id')}"
+                    )
+                ]
+            ]
+        )
+
         try:
-            await context.bot.send_message(admin_id, txt, parse_mode=ParseMode.HTML)
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=text_for_drivers,
+                reply_markup=keyboard,
+            )
         except Exception as e:
-            log.error("Не удалось отправить админу: %s", e)
+            log.error("Не удалось отправить заказ в группу водителей: %s", e)
 
     context.user_data.clear()
     return ConversationHandler.END
+
+
+# ---------- КНОПКИ ВОДИТЕЛЕЙ (бронь / отмена / на месте) ----------
+async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопок в группе водителей: взять/отменить/на месте."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    driver = query.from_user
+
+    global ORDERS_CACHE
+
+    # Взять заказ
+    if data.startswith("drv_take:"):
+        order_id = data.split(":", 1)[1]
+        order = ORDERS_CACHE.get(order_id)
+
+        if not order:
+            await query.answer("Этот заказ уже не активен или не найден.", show_alert=True)
+            return
+
+        if order.get("status") in ("assigned", "arrived"):
+            await query.answer("Этот заказ уже забрал другой водитель.", show_alert=True)
+            return
+
+        order["status"] = "assigned"
+        order["driver_id"] = driver.id
+        order["driver_name"] = driver.username or driver.full_name
+        ORDERS_CACHE[order_id] = order
+
+        new_text = query.message.text + f"\n\n✅ Заказ принял: @{order['driver_name']}"
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("🚗 На месте", callback_data=f"drv_arrived:{order_id}")],
+                [InlineKeyboardButton("🔴 Отменить заказ", callback_data=f"drv_cancel:{order_id}")],
+            ]
+        )
+        await query.edit_message_text(new_text, reply_markup=keyboard)
+
+    # Отменить заказ
+    elif data.startswith("drv_cancel:"):
+        order_id = data.split(":", 1)[1]
+        order = ORDERS_CACHE.get(order_id)
+
+        if not order:
+            await query.answer("Заказ не найден.", show_alert=True)
+            return
+
+        if order.get("driver_id") != driver.id:
+            await query.answer("Отменить может только водитель, принявший заказ.", show_alert=True)
+            return
+
+        order["status"] = "new"
+        order["driver_id"] = None
+        order["driver_name"] = None
+        ORDERS_CACHE[order_id] = order
+
+        base_lines = [
+            line for line in query.message.text.splitlines() if not line.startswith("✅ Заказ принял")
+        ]
+        new_text = "\n".join(base_lines) + "\n\n🔄 Заказ снова свободен."
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("🟢 Взять заказ", callback_data=f"drv_take:{order_id}")],
+            ]
+        )
+        await query.edit_message_text(new_text, reply_markup=keyboard)
+
+    # Водитель на месте (демо-оплата)
+    elif data.startswith("drv_arrived:"):
+        order_id = data.split(":", 1)[1]
+        order = ORDERS_CACHE.get(order_id)
+
+        if not order:
+            await query.answer("Заказ не найден.", show_alert=True)
+            return
+
+        if order.get("driver_id") != driver.id:
+            await query.answer("Отметить «на месте» может только принявший водитель.", show_alert=True)
+            return
+
+        order["status"] = "arrived"
+        ORDERS_CACHE[order_id] = order
+
+        client_id = order.get("user_id")
+        if client_id:
+            try:
+                await context.bot.send_message(
+                    chat_id=int(client_id),
+                    text=(
+                        "🚗 Ваш водитель на месте.\n"
+                        "Здесь в будущем будет кнопка для оплаты поездки 💳 (демо-версия)."
+                    ),
+                )
+            except Exception as e:
+                log.error("Не смог отправить сообщение клиенту: %s", e)
+
+        new_text = query.message.text + "\n\n🚗 Водитель на месте. Ожидаем клиента."
+        await query.edit_message_text(new_text)
+
 
 # ---------- РОУТИНГ ----------
 def build_app() -> Application:
@@ -354,10 +520,16 @@ def build_app() -> Application:
                 CallbackQueryHandler(confirm_cb, pattern="^(confirm|cancel)$"),
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel_cmd), MessageHandler(filters.Regex("^❌ Отмена$"), cancel_cmd)],
+        fallbacks=[
+            CommandHandler("cancel", cancel_cmd),
+            MessageHandler(filters.Regex("^❌ Отмена$"), cancel_cmd),
+        ],
         allow_reentry=True,
     )
     app.add_handler(conv)
+
+    # хендлер для кнопок водителей (drv_*)
+    app.add_handler(CallbackQueryHandler(driver_orders_callback, pattern=r"^drv_"))
 
     # Кнопки меню
     app.add_handler(MessageHandler(filters.Regex("^💰 Тарифы$"), price_cmd))
@@ -367,6 +539,7 @@ def build_app() -> Application:
 
     app.post_init = set_commands
     return app
+
 
 if __name__ == "__main__":
     app = build_app()
