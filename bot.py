@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# VIP Taxi Bot — минимальный, без картинок, с Google Sheets
+# VIP Taxi Bot — с Google Sheets, бронированием заказов и AI-чатом диспетчера
 
 import os
 import json
@@ -35,16 +35,18 @@ BRAND_NAME = "VIP taxi"
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")  # ID группы водителей (например -1003446115764)
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")  # для AI-чата диспетчера (опционально)
+
 assert BOT_TOKEN, "BOT_TOKEN is required"
 
-# Тарифы (примерная цена/час)
+# Тарифы (примерная цена/час, в тексте покажем как «от»)
 PRICES = {
-    "Maybach W223": "7000 ₽/ч",
-    "Maybach W222": "4000 ₽/ч",
-    "S-Class W223": "5000 ₽/ч",
-    "S-Class W222": "3000 ₽/ч",
-    "Business": "2000 ₽/ч",
-    "Minivan": "3000 ₽/ч",
+    "Maybach W223": "от 7000 ₽/ч",
+    "Maybach W222": "от 4000 ₽/ч",
+    "S-Class W223": "от 5000 ₽/ч",
+    "S-Class W222": "от 3000 ₽/ч",
+    "Business": "от 2000 ₽/ч",
+    "Minivan": "от 3000 ₽/ч",
 }
 
 # Память бота для бронирования заказов водителями:
@@ -52,7 +54,6 @@ PRICES = {
 ORDERS_CACHE: dict[str, dict] = {}
 
 # ---------- GOOGLE SHEETS ----------
-# Требуется Railway variable GOOGLE_APPLICATION_CREDENTIALS_JSON со всем JSON ключом
 from google.oauth2.service_account import Credentials
 import gspread
 
@@ -67,10 +68,29 @@ credentials = Credentials.from_service_account_info(
 gc = gspread.authorize(credentials)
 sheet = gc.open("orders").sheet1  # таблица: orders -> Лист1
 
+# Структура строк:
+# A: order_id
+# B: user_id
+# C: username
+# D: pickup
+# E: destination
+# F: car_class
+# G: time
+# H: passengers
+# I: contact
+# J: approx_price
+# K: created_at
+# L: status        (new / assigned / arrived)
+# M: driver_id
+# N: driver_name
+
 
 def save_order_to_sheet(order: dict) -> None:
     """Запись подтверждённого заказа в Google Sheets."""
     try:
+        status = order.get("status", "new")
+        driver_id = order.get("driver_id", "")
+        driver_name = order.get("driver_name", "")
         sheet.append_row(
             [
                 order.get("order_id"),
@@ -84,12 +104,42 @@ def save_order_to_sheet(order: dict) -> None:
                 order.get("contact"),
                 order.get("approx_price"),
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                status,
+                str(driver_id) if driver_id else "",
+                driver_name,
             ],
             value_input_option="USER_ENTERED",
         )
         log.info("Заказ записан в Google Sheets")
     except Exception as e:
         log.error("Ошибка Google Sheets: %s", e)
+
+
+def find_order_row(order_id: str):
+    """Ищем номер строки по order_id в первой колонке. Возвращаем номер строки или None."""
+    try:
+        records = sheet.col_values(1)  # A колонка
+        for idx, val in enumerate(records, start=1):
+            if val == order_id:
+                return idx
+    except Exception as e:
+        log.error("Ошибка поиска заказа в таблице: %s", e)
+    return None
+
+
+def update_order_status_in_sheet(order_id: str, status: str, driver_id=None, driver_name=None):
+    """Обновить статус и данные водителя по order_id в таблице."""
+    row = find_order_row(order_id)
+    if not row:
+        return
+    try:
+        # статус
+        sheet.update_cell(row, 12, status)  # L: status
+        # водитель
+        sheet.update_cell(row, 13, str(driver_id) if driver_id else "")  # M: driver_id
+        sheet.update_cell(row, 14, driver_name or "")  # N: driver_name
+    except Exception as e:
+        log.error("Ошибка обновления статуса заказа в таблице: %s", e)
 
 
 # ---------- КОНСТАНТЫ СОСТОЯНИЙ ----------
@@ -118,10 +168,10 @@ def cars_kb() -> ReplyKeyboardMarkup:
 
 
 def price_text() -> str:
-    lines = ["<b>Тарифы (примерно):</b>"]
+    lines = ["<b>Тарифы (ориентировочно):</b>"]
     for k, v in PRICES.items():
         lines.append(f"• {k}: {v}")
-    lines.append("\nМинимум 1 час. Точная стоимость зависит от маршрута и времени.")
+    lines.append("\nМинимум 1 час. Точная стоимость зависит от маршрута, времени и загрузки.")
     return "\n".join(lines)
 
 
@@ -144,6 +194,7 @@ async def set_commands(app: Application) -> None:
             BotCommand("status", "Статус заказа"),
             BotCommand("contact", "Связаться с диспетчером"),
             BotCommand("cancel", "Отмена"),
+            BotCommand("ai", "AI-чат для диспетчера"),
         ]
     )
 
@@ -186,12 +237,78 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+# ---------- AI-ЧАТ ДЛЯ ДИСПЕТЧЕРА ----------
+async def ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    question = " ".join(context.args).strip()
+    if not question:
+        await update.message.reply_text(
+            "Напишите так:\n"
+            "/ai ваш вопрос для ИИ.\n\n"
+            "Например:\n"
+            "/ai придумай вежливый ответ клиенту, что машина задерживается на 10 минут."
+        )
+        return
+
+    if not OPENAI_API_KEY:
+        await update.message.reply_text(
+            "AI-чат пока не настроен.\n"
+            "Добавьте переменную окружения OPENAI_API_KEY в Railway с ключом OpenAI, "
+            "и я смогу помогать как ИИ-диспетчер."
+        )
+        return
+
+    try:
+        import requests
+
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": "gpt-4.1-mini",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты вежливый и профессиональный диспетчер премиум-такси. "
+                        "Отвечай кратко, по делу, на русском. Не обещай ничего, "
+                        "что сервис явно не предоставляет. Не придумывай цены, если нет данных."
+                    ),
+                },
+                {"role": "user", "content": question},
+            ],
+            "max_tokens": 300,
+        }
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        answer = data["choices"][0]["message"]["content"].strip()
+        await update.message.reply_text(answer)
+    except ImportError:
+        await update.message.reply_text(
+            "Модуль requests не установлен в окружении.\n"
+            "Добавьте его в зависимости (requirements.txt), чтобы использовать AI-чат."
+        )
+    except Exception as e:
+        log.error("Ошибка AI-чата: %s", e)
+        await update.message.reply_text(
+            "Не удалось получить ответ от ИИ. Проверьте ключ OPENAI_API_KEY и интернет на сервере."
+        )
+
+
 # ---------- ЗАКАЗ (CONVERSATION) ----------
 async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["order"] = {
         "order_id": uuid4().hex[:8],
         "user_id": update.effective_user.id,
-        "username": f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.full_name,
+        "username": f"@{update.effective_user.username}"
+        if update.effective_user.username
+        else update.effective_user.full_name,
     }
     kb = ReplyKeyboardMarkup(
         [[KeyboardButton("Отправить мою геолокацию", request_location=True)], ["❌ Отмена"]],
@@ -256,7 +373,9 @@ async def time_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["order"]["time"] = update.message.text.strip()
     await update.message.reply_text(
         "Сколько пассажиров?",
-        reply_markup=ReplyKeyboardMarkup([["1", "2", "3", "4", "5", "6"], ["❌ Отмена"]], resize_keyboard=True),
+        reply_markup=ReplyKeyboardMarkup(
+            [["1", "2", "3", "4", "5", "6"], ["❌ Отмена"]], resize_keyboard=True
+        ),
     )
     return PAX
 
@@ -268,7 +387,9 @@ async def pax_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         resize_keyboard=True,
         one_time_keyboard=True,
     )
-    await update.message.reply_text("Оставьте контакт (имя и телефон), или поделитесь номером:", reply_markup=kb)
+    await update.message.reply_text(
+        "Оставьте контакт (имя и телефон), или поделитесь номером:", reply_markup=kb
+    )
     return CONTACT
 
 
@@ -291,7 +412,7 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         "<b>Проверьте заказ:</b>\n"
         f"• Подача: {o.get('pickup')}\n"
         f"• Назначение: {o.get('destination')}\n"
-        f"• Класс авто: {o.get('car_class')}  (≈ {o.get('approx_price')})\n"
+        f"• Класс авто: {o.get('car_class')}  ({o.get('approx_price')})\n"
         f"• Время: {o.get('time')}\n"
         f"• Пассажиров: {o.get('passengers')}\n"
         f"• Контакт: {o.get('contact')}\n\n"
@@ -321,10 +442,15 @@ async def confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # подтверждение
     order = context.user_data["order"]
 
+    # Изначальный статус
+    order["status"] = "new"
+    order["driver_id"] = None
+    order["driver_name"] = None
+
     # сохраняем в Google Sheets
     save_order_to_sheet(order)
 
-    # кладём в кэш для водителей (без личных данных в тексте)
+    # кладём в кэш для водителей
     global ORDERS_CACHE
     ORDERS_CACHE[order["order_id"]] = {
         **order,
@@ -347,7 +473,7 @@ async def confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             f"🆕 Новый заказ #{order.get('order_id')}\n"
             f"📍 Откуда: {order.get('pickup')}\n"
             f"🏁 Куда: {order.get('destination')}\n"
-            f"🚘 Класс: {order.get('car_class')}  (≈ {order.get('approx_price')})\n"
+            f"🚘 Класс: {order.get('car_class')}  ({order.get('approx_price')})\n"
             f"⏰ Время: {order.get('time')}\n"
             f"👥 Пассажиров: {order.get('passengers')}\n\n"
             f"Личные данные клиента скрыты."
@@ -378,7 +504,7 @@ async def confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 # ---------- КНОПКИ ВОДИТЕЛЕЙ (бронь / отмена / на месте) ----------
 async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик кнопок в группе водителей: взять/отменить/на месте."""
+    """Обработчик кнопок в группе водителей и в ЛС водителя: взять/отменить/на месте."""
     query = update.callback_query
     await query.answer()
     data = query.data
@@ -393,27 +519,70 @@ async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
 
         if not order:
             await query.answer("Этот заказ уже не активен или не найден.", show_alert=True)
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
             return
 
         if order.get("status") in ("assigned", "arrived"):
             await query.answer("Этот заказ уже забрал другой водитель.", show_alert=True)
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
             return
 
+        # Обновляем статус и водителя
         order["status"] = "assigned"
         order["driver_id"] = driver.id
         order["driver_name"] = driver.username or driver.full_name
         ORDERS_CACHE[order_id] = order
 
-        new_text = query.message.text + f"\n\n✅ Заказ принял: @{order['driver_name']}"
+        # Обновляем в таблице
+        update_order_status_in_sheet(
+            order_id=order_id,
+            status="assigned",
+            driver_id=driver.id,
+            driver_name=order["driver_name"],
+        )
+
+        # Удаляем сообщение из группы (заказ "исчезает" из общей ленты)
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+
+        # Отправляем ЛИЧНО водителю подробности (без телефона и имени клиента)
+        dm_text = (
+            f"Вы приняли заказ #{order_id}\n\n"
+            f"📍 Откуда: {order.get('pickup')}\n"
+            f"🏁 Куда: {order.get('destination')}\n"
+            f"🚘 Класс: {order.get('car_class')}  ({order.get('approx_price')})\n"
+            f"⏰ Время: {order.get('time')}\n"
+            f"👥 Пассажиров: {order.get('passengers')}\n\n"
+            f"Личные данные клиента скрыты. Дальнейшие инструкции выдаст диспетчер."
+        )
         keyboard = InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("🚗 На месте", callback_data=f"drv_arrived:{order_id}")],
-                [InlineKeyboardButton("🔴 Отменить заказ", callback_data=f"drv_cancel:{order_id}")],
+                [
+                    InlineKeyboardButton("🚗 На месте", callback_data=f"drv_arrived:{order_id}"),
+                ],
+                [
+                    InlineKeyboardButton("🔴 Отменить заказ", callback_data=f"drv_cancel:{order_id}"),
+                ],
             ]
         )
-        await query.edit_message_text(new_text, reply_markup=keyboard)
+        try:
+            await context.bot.send_message(
+                chat_id=driver.id,
+                text=dm_text,
+                reply_markup=keyboard,
+            )
+        except Exception as e:
+            log.error("Не удалось отправить заказ в ЛС водителю: %s", e)
 
-    # Отменить заказ
+    # Отменить заказ водителем
     elif data.startswith("drv_cancel:"):
         order_id = data.split(":", 1)[1]
         order = ORDERS_CACHE.get(order_id)
@@ -426,22 +595,58 @@ async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
             await query.answer("Отменить может только водитель, принявший заказ.", show_alert=True)
             return
 
+        # Возвращаем статус
         order["status"] = "new"
         order["driver_id"] = None
         order["driver_name"] = None
         ORDERS_CACHE[order_id] = order
 
-        base_lines = [
-            line for line in query.message.text.splitlines() if not line.startswith("✅ Заказ принял")
-        ]
-        new_text = "\n".join(base_lines) + "\n\n🔄 Заказ снова свободен."
-
-        keyboard = InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("🟢 Взять заказ", callback_data=f"drv_take:{order_id}")],
-            ]
+        update_order_status_in_sheet(
+            order_id=order_id,
+            status="new",
+            driver_id=None,
+            driver_name=None,
         )
-        await query.edit_message_text(new_text, reply_markup=keyboard)
+
+        # Правим сообщение в ЛС
+        try:
+            await query.edit_message_text("Вы отменили заказ. Он возвращён в общий список.")
+        except Exception:
+            pass
+
+        # Отправляем заказ обратно в группу водителей
+        try:
+            admin_id = int(ADMIN_CHAT_ID) if ADMIN_CHAT_ID else None
+        except ValueError:
+            admin_id = ADMIN_CHAT_ID
+
+        if admin_id:
+            text_for_drivers = (
+                f"🆕 Заказ снова доступен #{order_id}\n"
+                f"📍 Откуда: {order.get('pickup')}\n"
+                f"🏁 Куда: {order.get('destination')}\n"
+                f"🚘 Класс: {order.get('car_class')}  ({order.get('approx_price')})\n"
+                f"⏰ Время: {order.get('time')}\n"
+                f"👥 Пассажиров: {order.get('passengers')}\n\n"
+                f"Личные данные клиента скрыты."
+            )
+            keyboard = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "🟢 Взять заказ", callback_data=f"drv_take:{order_id}"
+                        )
+                    ]
+                ]
+            )
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=text_for_drivers,
+                    reply_markup=keyboard,
+                )
+            except Exception as e:
+                log.error("Не удалось вернуть заказ в группу водителей: %s", e)
 
     # Водитель на месте (демо-оплата)
     elif data.startswith("drv_arrived:"):
@@ -453,12 +658,23 @@ async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
             return
 
         if order.get("driver_id") != driver.id:
-            await query.answer("Отметить «на месте» может только принявший водитель.", show_alert=True)
+            await query.answer(
+                "Отметить «на месте» может только водитель, принявший заказ.",
+                show_alert=True,
+            )
             return
 
         order["status"] = "arrived"
         ORDERS_CACHE[order_id] = order
 
+        update_order_status_in_sheet(
+            order_id=order_id,
+            status="arrived",
+            driver_id=order.get("driver_id"),
+            driver_name=order.get("driver_name"),
+        )
+
+        # ДЕМО-ОПЛАТА: просто сообщаем клиенту без реальных платежей
         client_id = order.get("user_id")
         if client_id:
             try:
@@ -466,14 +682,16 @@ async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
                     chat_id=int(client_id),
                     text=(
                         "🚗 Ваш водитель на месте.\n"
-                        "Здесь в будущем будет кнопка для оплаты поездки 💳 (демо-версия)."
+                        "В ближайшем будущем здесь появится кнопка для оплаты поездки 💳 (демо-версия)."
                     ),
                 )
             except Exception as e:
                 log.error("Не смог отправить сообщение клиенту: %s", e)
 
-        new_text = query.message.text + "\n\n🚗 Водитель на месте. Ожидаем клиента."
-        await query.edit_message_text(new_text)
+        try:
+            await query.edit_message_text("Отметили: вы на месте. Ожидаем клиента.")
+        except Exception:
+            pass
 
 
 # ---------- РОУТИНГ ----------
@@ -487,6 +705,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("contact", contact_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
+    app.add_handler(CommandHandler("ai", ai_cmd))
 
     # разговор заказов
     conv = ConversationHandler(
