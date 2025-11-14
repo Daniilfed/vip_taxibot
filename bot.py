@@ -6,7 +6,7 @@ import json
 import logging
 from uuid import uuid4
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 from telegram import (
     Update,
@@ -58,6 +58,17 @@ ORDERS_CACHE: Dict[str, Dict[str, Any]] = {}
 
 # Активные чаты клиент–водитель через бота: user_id -> other_user_id
 ACTIVE_CHATS: Dict[int, int] = {}
+
+# укажи здесь водителей и какие тарифы им разрешены
+DRIVER_TARIFFS: Dict[int, List[str]] = {
+    # Примеры (замени на свои ID):
+    # 143710784: ["S-Class W223", "S-Class W222"],   # допустим, ты
+    # 222222222: ["Maybach W223", "Maybach W222"],
+    # 333333333: ["Business", "Minivan"],
+}
+# Логика: если driver.id есть в словаре -> он может брать ТОЛЬКО эти тарифы.
+# Если driver.id нет в словаре -> ему разрешено всё (для тестов и пока ты не заполнил таблицу).
+
 
 # ---------- GOOGLE SHEETS ----------
 from google.oauth2.service_account import Credentials
@@ -542,7 +553,7 @@ async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
     data = query.data
     driver = query.from_user
 
-    global ORDERS_CACHE, ACTIVE_CHATS
+    global ORDERS_CACHE, ACTIVE_CHATS, DRIVER_TARIFFS
 
     # Взять заказ
     if data.startswith("drv_take:"):
@@ -555,6 +566,17 @@ async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
                 await query.message.delete()
             except Exception:
                 pass
+            return
+
+        # --- ОГРАНИЧЕНИЕ ПО ТАРИФАМ ---
+        allowed_classes = DRIVER_TARIFFS.get(driver.id)
+        order_class = order.get("car_class")
+
+        if allowed_classes is not None and order_class not in allowed_classes:
+            await query.answer(
+                "Вы не можете взять этот заказ: он для другого класса авто.",
+                show_alert=True,
+            )
             return
 
         if order.get("status") in ("assigned", "arrived"):
@@ -585,11 +607,13 @@ async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
         except Exception:
             pass
 
-        # Отправляем ЛИЧНО водителю подробности (без телефона и имени клиента)
+        # Отправляем ЛИЧНО водителю подробности (с адресами)
+        pickup = order.get("pickup", "—")
+        dest = order.get("destination", "—")
         dm_text = (
-            f"Вы приняли заказ #{order_id}\n\n"
-            f"📍 Откуда: {order.get('pickup')}\n"
-            f"🏁 Куда: {order.get('destination')}\n"
+            f"✅ Вы приняли заказ #{order_id}\n\n"
+            f"📍 Подача:\n{pickup}\n\n"
+            f"🏁 Назначение:\n{dest}\n\n"
             f"🚘 Класс: {order.get('car_class')}  ({order.get('approx_price')})\n"
             f"⏰ Время: {order.get('time')}\n"
             f"👥 Пассажиров: {order.get('passengers')}\n\n"
@@ -653,10 +677,12 @@ async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
             admin_id = ADMIN_CHAT_ID
 
         if admin_id:
+            pickup = order.get("pickup", "—")
+            dest = order.get("destination", "—")
             text_for_drivers = (
                 f"🆕 Заказ снова доступен #{order_id}\n"
-                f"📍 Откуда: {order.get('pickup')}\n"
-                f"🏁 Куда: {order.get('destination')}\n"
+                f"📍 Откуда: {pickup}\n"
+                f"🏁 Куда: {dest}\n"
                 f"🚘 Класс: {order.get('car_class')}  ({order.get('approx_price')})\n"
                 f"⏰ Время: {order.get('time')}\n"
                 f"👥 Пассажиров: {order.get('passengers')}\n\n"
@@ -707,6 +733,9 @@ async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
         )
 
         client_id = order.get("user_id")
+        pickup = order.get("pickup", "—")
+        dest = order.get("destination", "—")
+
         if client_id:
             # включаем чат клиент–водитель
             ACTIVE_CHATS[int(client_id)] = int(driver.id)
@@ -717,9 +746,11 @@ async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
                 await context.bot.send_message(
                     chat_id=int(client_id),
                     text=(
-                        "🚗 Ваш водитель на месте.\n"
-                        "Сейчас откроется защищённый чат через бота.\n"
-                        "Пишите здесь всё, что касается поездки. Номер телефона не раскрывается."
+                        "🚗 Ваш водитель на месте.\n\n"
+                        f"📍 Подача:\n{pickup}\n\n"
+                        f"🏁 Маршрут:\n{dest}\n\n"
+                        "Через этого бота открыт защищённый чат с водителем.\n"
+                        "Пишите сюда всё, что касается поездки. Номер телефона не раскрывается."
                     ),
                 )
             except Exception as e:
@@ -730,7 +761,9 @@ async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
                 await context.bot.send_message(
                     chat_id=int(driver.id),
                     text=(
-                        "💬 Чат с клиентом активирован.\n"
+                        "💬 Чат с клиентом активирован.\n\n"
+                        f"📍 Подача:\n{pickup}\n\n"
+                        f"🏁 Маршрут:\n{dest}\n\n"
                         "Пишите сюда — бот будет пересылать сообщения клиенту.\n"
                         "Номера телефонов скрыты."
                     ),
