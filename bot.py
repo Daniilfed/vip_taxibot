@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-# VIP Taxi Bot — с Google Sheets, бронированием заказов и AI-чатом диспетчера
+# VIP Taxi Bot — Google Sheets + бронирование заказов + AI-диспетчер
 
 import os
 import json
 import logging
 from uuid import uuid4
 from datetime import datetime
+from typing import Dict, Any
 
 from telegram import (
     Update,
@@ -34,10 +35,13 @@ log = logging.getLogger("vip_taxi_bot")
 BRAND_NAME = "VIP taxi"
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")  # ID группы водителей (например -1003446115764)
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")  # для AI-чата диспетчера (опционально)
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")  # ID группы водителей (например: -1003446...)
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")  # ключ OpenAI для AI-диспетчера (опционально)
+GOOGLE_JSON_ENV = "GOOGLE_APPLICATION_CREDENTIALS_JSON"
+SHEET_ID = os.environ.get("SHEET_ID")  # можно не задавать, тогда ищем по имени "orders"
 
 assert BOT_TOKEN, "BOT_TOKEN is required"
+assert GOOGLE_JSON_ENV in os.environ, "GOOGLE_APPLICATION_CREDENTIALS_JSON is required"
 
 # Тарифы (примерная цена/час, в тексте покажем как «от»)
 PRICES = {
@@ -49,26 +53,34 @@ PRICES = {
     "Minivan": "от 3000 ₽/ч",
 }
 
-# Память бота для бронирования заказов водителями:
-# order_id -> dict(order_data + статус и водитель)
-ORDERS_CACHE: dict[str, dict] = {}
+# Кэш заказов: order_id -> данные заказа (для действий водителей)
+ORDERS_CACHE: Dict[str, Dict[str, Any]] = {}
 
 # ---------- GOOGLE SHEETS ----------
 from google.oauth2.service_account import Credentials
 import gspread
 
-credentials_info = json.loads(os.environ["GOOGLE_APPLICATION_CREDENTIALS_JSON"])
+credentials_info = json.loads(os.environ[GOOGLE_JSON_ENV])
 credentials = Credentials.from_service_account_info(
     credentials_info,
     scopes=[
         "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",  # доступ к таблице
+        "https://www.googleapis.com/auth/drive",
     ],
 )
 gc = gspread.authorize(credentials)
-sheet = gc.open("orders").sheet1  # таблица: orders -> Лист1
 
-# Структура строк:
+try:
+    if SHEET_ID:
+        sh = gc.open_by_key(SHEET_ID)
+    else:
+        sh = gc.open("orders")  # таблица по имени
+    sheet = sh.sheet1          # первый лист
+except Exception as e:
+    log.error("Не удалось открыть Google Sheets: %s", e)
+    raise
+
+# Структура строк в таблице:
 # A: order_id
 # B: user_id
 # C: username
@@ -85,7 +97,7 @@ sheet = gc.open("orders").sheet1  # таблица: orders -> Лист1
 # N: driver_name
 
 
-def save_order_to_sheet(order: dict) -> None:
+def save_order_to_sheet(order: Dict[str, Any]) -> None:
     """Запись подтверждённого заказа в Google Sheets."""
     try:
         status = order.get("status", "new")
@@ -133,9 +145,7 @@ def update_order_status_in_sheet(order_id: str, status: str, driver_id=None, dri
     if not row:
         return
     try:
-        # статус
         sheet.update_cell(row, 12, status)  # L: status
-        # водитель
         sheet.update_cell(row, 13, str(driver_id) if driver_id else "")  # M: driver_id
         sheet.update_cell(row, 14, driver_name or "")  # N: driver_name
     except Exception as e:
@@ -242,9 +252,6 @@ async def ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     AI-диспетчер.
     /ai <ситуация> -> бот возвращает ГОТОВЫЙ текст для клиента.
-    Примеры:
-    /ai машина задерживается на 15 минут
-    /ai клиент жалуется, что дорого
     """
     question = " ".join(context.args).strip()
     if not question:
@@ -267,86 +274,44 @@ async def ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     try:
         import requests
-
-        # КОНТЕКСТ ДЛЯ ИИ: жёстко объясняем, что он — диспетчер
-        system_prompt = (
-            "Ты — живой диспетчер премиум-такси (VIP такси). "
-            "Твоя задача — писать ГОТОВЫЕ сообщения для клиента от лица сервиса такси.\n\n"
-            "Правила:\n"
-            "1) Всегда обращайся к клиенту на ВЫ.\n"
-            "2) Пиши максимально вежливо, спокойно и по делу.\n"
-            "3) Не упоминай, что ты ИИ, бот, модель и т.п. Ты просто диспетчер.\n"
-            "4) Не придумывай конкретные ЦЕНЫ и ТАРИФЫ, если в запросе они не указаны. "
-            "   Можно писать общие фразы: «стоимость уточнит диспетчер», «ориентировочно» и т.п.\n"
-            "5) Отвечай коротко: 1–3 предложения. Без длинных объяснений.\n"
-            "6) Если ситуация конфликтная — сохраняй уважение, предлагай решение.\n"
-            "7) Никаких смайликов кроме максимум 1–2 нейтральных (типа 🙂, 🙏) при уместности.\n\n"
-            "Тебе в запросе будет приходить ОПИСАНИЕ СИТУАЦИИ. "
-            "Нужно вернуть только текст сообщения для клиента."
-        )
-
-        headers = {
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "model": "gpt-4.1-mini",
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": question},
-            ],
-            "max_tokens": 250,
-        }
-
-        resp = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=20,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        answer = data["choices"][0]["message"]["content"].strip()
-
-        await update.message.reply_text(answer)
-
     except ImportError:
         await update.message.reply_text(
             "Модуль requests не установлен в окружении.\n"
-            "Добавьте его в requirements.txt, чтобы использовать AI-чат."
+            "Он уже есть в requirements.txt, просто пересоберите проект."
         )
         return
 
-    if not OPENAI_API_KEY:
-        await update.message.reply_text(
-            "AI-чат пока не настроен.\n"
-            "Добавьте переменную окружения OPENAI_API_KEY в Railway с ключом OpenAI, "
-            "и я смогу помогать как ИИ-диспетчер."
-        )
-        return
+    system_prompt = (
+        "Ты — живой диспетчер премиум-такси (VIP такси). "
+        "Твоя задача — писать ГОТОВЫЕ сообщения для клиента от лица сервиса такси.\n\n"
+        "Правила:\n"
+        "1) Всегда обращайся к клиенту на ВЫ.\n"
+        "2) Пиши максимально вежливо, спокойно и по делу.\n"
+        "3) Не упоминай, что ты ИИ, бот, модель и т.п. Ты просто диспетчер.\n"
+        "4) Не придумывай конкретные ЦЕНЫ и ТАРИФЫ, если в запросе они не указаны. "
+        "   Можно писать общие фразы: «стоимость уточнит диспетчер», «ориентировочно» и т.п.\n"
+        "5) Отвечай коротко: 1–3 предложения. Без длинных объяснений.\n"
+        "6) Если ситуация конфликтная — сохраняй уважение, предлагай решение.\n"
+        "7) Никаких смайликов, максимум 1–2 нейтральных (🙂, 🙏) при уместности.\n\n"
+        "На вход ты получаешь ОПИСАНИЕ СИТУАЦИИ. "
+        "Нужно вернуть только текст сообщения для клиента."
+    )
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": "gpt-4.1-mini",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": question},
+        ],
+        "max_tokens": 250,
+    }
 
     try:
-        import requests
-
-        headers = {
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "model": "gpt-4.1-mini",
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "Ты вежливый и профессиональный диспетчер премиум-такси. "
-                        "Отвечай кратко, по делу, на русском. Не обещай ничего, "
-                        "что сервис явно не предоставляет. Не придумывай цены, если нет данных."
-                    ),
-                },
-                {"role": "user", "content": question},
-            ],
-            "max_tokens": 300,
-        }
+        import requests  # ещё раз для mypy/линтеров, но это ок
         resp = requests.post(
             "https://api.openai.com/v1/chat/completions",
             headers=headers,
@@ -357,11 +322,6 @@ async def ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         data = resp.json()
         answer = data["choices"][0]["message"]["content"].strip()
         await update.message.reply_text(answer)
-    except ImportError:
-        await update.message.reply_text(
-            "Модуль requests не установлен в окружении.\n"
-            "Добавьте его в зависимости (requirements.txt), чтобы использовать AI-чат."
-        )
     except Exception as e:
         log.error("Ошибка AI-чата: %s", e)
         await update.message.reply_text(
@@ -392,8 +352,7 @@ async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
 async def pickup_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     loc = update.message.location
-    link = to_maps_link(loc.latitude, loc.longitude)
-    context.user_data["order"]["pickup"] = link
+    context.user_data["order"]["pickup"] = to_maps_link(loc.latitude, loc.longitude)
     await update.message.reply_text(
         "Точка подачи получена.\n📍 Отправьте адрес назначения.",
         reply_markup=ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True),
@@ -502,6 +461,7 @@ async def confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
     data = q.data
+
     if data == "cancel":
         context.user_data.clear()
         await q.edit_message_text("Отменено. Чем ещё помочь?")
@@ -510,27 +470,21 @@ async def confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # подтверждение
     order = context.user_data["order"]
 
-    # Изначальный статус
+    # начальный статус
     order["status"] = "new"
     order["driver_id"] = None
     order["driver_name"] = None
 
-    # сохраняем в Google Sheets
+    # сохраняем в таблицу
     save_order_to_sheet(order)
 
-    # кладём в кэш для водителей
-    global ORDERS_CACHE
-    ORDERS_CACHE[order["order_id"]] = {
-        **order,
-        "status": "new",
-        "driver_id": None,
-        "driver_name": None,
-    }
+    # кладём в кэш
+    ORDERS_CACHE[order["order_id"]] = dict(order)
 
-    # Сообщение пользователю
+    # пользователь
     await q.edit_message_text("Заказ принят. Водитель свяжется с вами.")
 
-    # Отправляем чистый заказ в группу водителей (без имени, телефона и tg-id)
+    # отправляем в группу водителей
     try:
         admin_id = int(ADMIN_CHAT_ID) if ADMIN_CHAT_ID else None
     except ValueError:
@@ -546,7 +500,6 @@ async def confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             f"👥 Пассажиров: {order.get('passengers')}\n\n"
             f"Личные данные клиента скрыты."
         )
-
         keyboard = InlineKeyboardMarkup(
             [
                 [
@@ -556,7 +509,6 @@ async def confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 ]
             ]
         )
-
         try:
             await context.bot.send_message(
                 chat_id=admin_id,
@@ -570,15 +522,13 @@ async def confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
-# ---------- КНОПКИ ВОДИТЕЛЕЙ (бронь / отмена / на месте) ----------
+# ---------- КНОПКИ ВОДИТЕЛЕЙ ----------
 async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик кнопок в группе водителей и в ЛС водителя: взять/отменить/на месте."""
     query = update.callback_query
     await query.answer()
     data = query.data
     driver = query.from_user
-
-    global ORDERS_CACHE
 
     # Взять заказ
     if data.startswith("drv_take:"):
@@ -607,7 +557,7 @@ async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
         order["driver_name"] = driver.username or driver.full_name
         ORDERS_CACHE[order_id] = order
 
-        # Обновляем в таблице
+        # Таблица
         update_order_status_in_sheet(
             order_id=order_id,
             status="assigned",
@@ -615,13 +565,13 @@ async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
             driver_name=order["driver_name"],
         )
 
-        # Удаляем сообщение из группы (заказ "исчезает" из общей ленты)
+        # Удаляем сообщение из группы
         try:
             await query.message.delete()
         except Exception:
             pass
 
-        # Отправляем ЛИЧНО водителю подробности (без телефона и имени клиента)
+        # Личные сообщения водителю (важно: водитель должен сначала нажать /start бота в ЛС!)
         dm_text = (
             f"Вы приняли заказ #{order_id}\n\n"
             f"📍 Откуда: {order.get('pickup')}\n"
@@ -633,12 +583,8 @@ async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
         )
         keyboard = InlineKeyboardMarkup(
             [
-                [
-                    InlineKeyboardButton("🚗 На месте", callback_data=f"drv_arrived:{order_id}"),
-                ],
-                [
-                    InlineKeyboardButton("🔴 Отменить заказ", callback_data=f"drv_cancel:{order_id}"),
-                ],
+                [InlineKeyboardButton("🚗 На месте", callback_data=f"drv_arrived:{order_id}")],
+                [InlineKeyboardButton("🔴 Отменить заказ", callback_data=f"drv_cancel:{order_id}")],
             ]
         )
         try:
@@ -676,13 +622,13 @@ async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
             driver_name=None,
         )
 
-        # Правим сообщение в ЛС
+        # ЛС водителю
         try:
             await query.edit_message_text("Вы отменили заказ. Он возвращён в общий список.")
         except Exception:
             pass
 
-        # Отправляем заказ обратно в группу водителей
+        # Возвращаем заказ в группу
         try:
             admin_id = int(ADMIN_CHAT_ID) if ADMIN_CHAT_ID else None
         except ValueError:
@@ -742,7 +688,7 @@ async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
             driver_name=order.get("driver_name"),
         )
 
-        # ДЕМО-ОПЛАТА: просто сообщаем клиенту без реальных платежей
+        # ДЕМО-ОПЛАТА: отправляем клиенту сообщение, без реальных платежей
         client_id = order.get("user_id")
         if client_id:
             try:
@@ -815,10 +761,10 @@ def build_app() -> Application:
     )
     app.add_handler(conv)
 
-    # хендлер для кнопок водителей (drv_*)
+    # кнопки водителей
     app.add_handler(CallbackQueryHandler(driver_orders_callback, pattern=r"^drv_"))
 
-    # Кнопки меню
+    # кнопки меню
     app.add_handler(MessageHandler(filters.Regex("^💰 Тарифы$"), price_cmd))
     app.add_handler(MessageHandler(filters.Regex("^📌 Статус$"), status_cmd))
     app.add_handler(MessageHandler(filters.Regex("^☎️ Контакт$"), contact_cmd))
