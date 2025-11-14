@@ -356,7 +356,8 @@ async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
 async def pickup_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     loc = update.message.location
-    context.user_data["order"]["pickup"] = to_maps_link(loc.latitude, loc.longitude)
+    link = to_maps_link(loc.latitude, loc.longitude)
+    context.user_data["order"]["pickup"] = link
     await update.message.reply_text(
         "Точка подачи получена.\n📍 Отправьте адрес назначения.",
         reply_markup=ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True),
@@ -465,7 +466,6 @@ async def confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query
     await q.answer()
     data = q.data
-
     if data == "cancel":
         context.user_data.clear()
         await q.edit_message_text("Отменено. Чем ещё помочь?")
@@ -474,21 +474,27 @@ async def confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # подтверждение
     order = context.user_data["order"]
 
-    # начальный статус
+    # Изначальный статус
     order["status"] = "new"
     order["driver_id"] = None
     order["driver_name"] = None
 
-    # сохраняем в таблицу
+    # сохраняем в Google Sheets
     save_order_to_sheet(order)
 
-    # кладём в кэш
-    ORDERS_CACHE[order["order_id"]] = dict(order)
+    # кладём в кэш для водителей
+    global ORDERS_CACHE
+    ORDERS_CACHE[order["order_id"]] = {
+        **order,
+        "status": "new",
+        "driver_id": None,
+        "driver_name": None,
+    }
 
-    # пользователь
+    # Сообщение пользователю
     await q.edit_message_text("Заказ принят. Водитель свяжется с вами.")
 
-    # отправляем в группу водителей
+    # Отправляем чистый заказ в группу водителей (без имени, телефона и tg-id)
     try:
         admin_id = int(ADMIN_CHAT_ID) if ADMIN_CHAT_ID else None
     except ValueError:
@@ -504,6 +510,7 @@ async def confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             f"👥 Пассажиров: {order.get('passengers')}\n\n"
             f"Личные данные клиента скрыты."
         )
+
         keyboard = InlineKeyboardMarkup(
             [
                 [
@@ -513,6 +520,7 @@ async def confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 ]
             ]
         )
+
         try:
             await context.bot.send_message(
                 chat_id=admin_id,
@@ -526,13 +534,15 @@ async def confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
-# ---------- КНОПКИ ВОДИТЕЛЕЙ (взять / отменить / на месте) ----------
+# ---------- КНОПКИ ВОДИТЕЛЕЙ (бронь / отмена / на месте) + запуск чата ----------
 async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик кнопок в группе водителей и в ЛС водителя: взять/отменить/на месте."""
     query = update.callback_query
     await query.answer()
     data = query.data
     driver = query.from_user
+
+    global ORDERS_CACHE, ACTIVE_CHATS
 
     # Взять заказ
     if data.startswith("drv_take:"):
@@ -561,7 +571,7 @@ async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
         order["driver_name"] = driver.username or driver.full_name
         ORDERS_CACHE[order_id] = order
 
-        # Таблица
+        # Обновляем в таблице
         update_order_status_in_sheet(
             order_id=order_id,
             status="assigned",
@@ -569,13 +579,13 @@ async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
             driver_name=order["driver_name"],
         )
 
-        # Удаляем сообщение из группы
+        # Удаляем сообщение из группы (заказ "исчезает" из общей ленты)
         try:
             await query.message.delete()
         except Exception:
             pass
 
-        # Личные сообщения водителю (водитель общается с ботом)
+        # Отправляем ЛИЧНО водителю подробности (без телефона и имени клиента)
         dm_text = (
             f"Вы приняли заказ #{order_id}\n\n"
             f"📍 Откуда: {order.get('pickup')}\n"
@@ -583,13 +593,16 @@ async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
             f"🚘 Класс: {order.get('car_class')}  ({order.get('approx_price')})\n"
             f"⏰ Время: {order.get('time')}\n"
             f"👥 Пассажиров: {order.get('passengers')}\n\n"
-            f"Личные данные клиента скрыты. "
-            f"После прибытия нажмите «🚗 На месте», и откроется чат с клиентом через бота."
+            f"Личные данные клиента скрыты. Дальнейшие инструкции выдаст диспетчер."
         )
         keyboard = InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("🚗 На месте", callback_data=f"drv_arrived:{order_id}")],
-                [InlineKeyboardButton("🔴 Отменить заказ", callback_data=f"drv_cancel:{order_id}")],
+                [
+                    InlineKeyboardButton("🚗 На месте", callback_data=f"drv_arrived:{order_id}"),
+                ],
+                [
+                    InlineKeyboardButton("🔴 Отменить заказ", callback_data=f"drv_cancel:{order_id}"),
+                ],
             ]
         )
         try:
@@ -627,13 +640,13 @@ async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
             driver_name=None,
         )
 
-        # ЛС водителю
+        # Правим сообщение в ЛС
         try:
             await query.edit_message_text("Вы отменили заказ. Он возвращён в общий список.")
         except Exception:
             pass
 
-        # Возвращаем заказ в группу
+        # Отправляем заказ обратно в группу водителей
         try:
             admin_id = int(ADMIN_CHAT_ID) if ADMIN_CHAT_ID else None
         except ValueError:
@@ -667,7 +680,7 @@ async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
             except Exception as e:
                 log.error("Не удалось вернуть заказ в группу водителей: %s", e)
 
-    # Водитель на месте — включаем чат через бота
+    # Водитель на месте (демо-оплата + запуск чата)
     elif data.startswith("drv_arrived:"):
         order_id = data.split(":", 1)[1]
         order = ORDERS_CACHE.get(order_id)
@@ -694,94 +707,89 @@ async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
         )
 
         client_id = order.get("user_id")
-
-        # Сообщаем клиенту (через бота)
         if client_id:
+            # включаем чат клиент–водитель
+            ACTIVE_CHATS[int(client_id)] = int(driver.id)
+            ACTIVE_CHATS[int(driver.id)] = int(client_id)
+
+            # сообщение клиенту
             try:
                 await context.bot.send_message(
                     chat_id=int(client_id),
                     text=(
-                        "🚗 Ваш водитель на месте.\n\n"
-                        "Сейчас откроется чат с водителем через бота. "
-                        "Пишите свои сообщения в этот чат — мы передадим их водителю, "
-                        "а его ответы — вам.\n"
-                        "Телефоны и личные контакты остаются скрыты."
+                        "🚗 Ваш водитель на месте.\n"
+                        "Сейчас откроется защищённый чат через бота.\n"
+                        "Пишите здесь всё, что касается поездки. Номер телефона не раскрывается."
                     ),
                 )
             except Exception as e:
                 log.error("Не смог отправить сообщение клиенту: %s", e)
 
-        # Сообщаем водителю и подключаем чат
+            # сообщение водителю
+            try:
+                await context.bot.send_message(
+                    chat_id=int(driver.id),
+                    text=(
+                        "💬 Чат с клиентом активирован.\n"
+                        "Пишите сюда — бот будет пересылать сообщения клиенту.\n"
+                        "Номера телефонов скрыты."
+                    ),
+                )
+            except Exception as e:
+                log.error("Не смог отправить сообщение водителю: %s", e)
+
         try:
-            await query.edit_message_text(
-                "Отметили: вы на месте.\n\n"
-                "Теперь это чат с клиентом через бота.\n"
-                "Пишите сюда — сообщения будут уходить клиенту.\n"
-                "Команда /endchat — завершить диалог."
-            )
+            await query.edit_message_text("Отметили: вы на месте. Чат с клиентом включён.")
         except Exception:
             pass
 
-        # Регистрируем чат клиент–водитель в ACTIVE_CHATS
-        if client_id:
-            ACTIVE_CHATS[driver.id] = int(client_id)
-            ACTIVE_CHATS[int(client_id)] = driver.id
-            log.info("Открыт чат через бота: driver %s <-> client %s", driver.id, client_id)
 
-
-# ---------- ЗАВЕРШЕНИЕ ЧАТА ----------
+# ---------- /endchat ----------
 async def endchat_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Команда /endchat — завершает чат клиент–водитель через бота для обеих сторон."""
+    """Команда, чтобы вручную завершить чат клиент–водитель."""
     user_id = update.effective_user.id
-    other_id = ACTIVE_CHATS.get(user_id)
-
-    if not other_id:
-        await update.message.reply_text("У вас сейчас нет активного чата через бота.")
-        return
-
-    # Удаляем связи с обеих сторон
-    ACTIVE_CHATS.pop(user_id, None)
-    ACTIVE_CHATS.pop(other_id, None)
-
-    # Сообщаем обоим
-    try:
-        await context.bot.send_message(
-            chat_id=other_id,
-            text="Диалог через бота завершён одной из сторон.",
-        )
-    except Exception as e:
-        log.error("Не удалось уведомить вторую сторону при endchat: %s", e)
-
-    await update.message.reply_text("Вы завершили диалог через бота.")
+    partner_id = ACTIVE_CHATS.pop(user_id, None)
+    if partner_id:
+        # удалить обратную связь тоже
+        ACTIVE_CHATS.pop(partner_id, None)
+        try:
+            await context.bot.send_message(
+                chat_id=partner_id,
+                text="Чат завершён диспетчером или второй стороной.",
+            )
+        except Exception:
+            pass
+        await update.message.reply_text("Вы завершили чат.")
+    else:
+        await update.message.reply_text("У вас сейчас нет активного чата.")
 
 
 # ---------- РЕЛЕЙ ЧАТА ЧЕРЕЗ БОТА ----------
 async def relay_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Если пользователь участвует в ACTIVE_CHATS, пересылаем его сообщения второй стороне.
-    Телефоны и контакты остаются скрыты: пересылается только текст.
+    Если у пользователя есть активный собеседник в ACTIVE_CHATS,
+    пересылаем текст между ними.
+    Никаких номеров телефонов при этом не видно.
     """
-    if not update.message or not update.message.text:
-        return
-
     user_id = update.effective_user.id
-    text = update.message.text
-
-    # Не перехватываем команды (начинаются с /)
-    if text.startswith("/"):
+    partner_id = ACTIVE_CHATS.get(user_id)
+    if not partner_id:
+        # нет активного собеседника — игнорируем (пусть обработают другие хендлеры выше)
         return
 
-    other_id = ACTIVE_CHATS.get(user_id)
-    if not other_id:
+    msg = update.message
+    text = msg.text or msg.caption or ""
+    if not text.strip():
+        # Пока пересылаем только текст
         return
 
     try:
         await context.bot.send_message(
-            chat_id=other_id,
+            chat_id=partner_id,
             text=text,
         )
     except Exception as e:
-        log.error("Ошибка при пересылке сообщения через чат бота: %s", e)
+        log.error("Не удалось переслать сообщение в чат: %s", e)
 
 
 # ---------- РОУТИНГ ----------
@@ -829,7 +837,7 @@ def build_app() -> Application:
             CONFIRM: [
                 CallbackQueryHandler(confirm_cb, pattern="^(confirm|cancel)$"),
             ],
-        ],
+        },
         fallbacks=[
             CommandHandler("cancel", cancel_cmd),
             MessageHandler(filters.Regex("^❌ Отмена$"), cancel_cmd),
@@ -838,7 +846,7 @@ def build_app() -> Application:
     )
     app.add_handler(conv)
 
-    # кнопки водителей
+    # хендлер для кнопок водителей (drv_*)
     app.add_handler(CallbackQueryHandler(driver_orders_callback, pattern=r"^drv_"))
 
     # Кнопки меню
