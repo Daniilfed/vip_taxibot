@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# VIP Taxi Bot — Google Sheets + бронирование заказов + AI-диспетчер
+# VIP Taxi Bot — Google Sheets + бронирование заказов + AI-диспетчер + чат клиент–водитель через бота
 
 import os
 import json
@@ -55,6 +55,9 @@ PRICES = {
 
 # Кэш заказов: order_id -> данные заказа (для действий водителей)
 ORDERS_CACHE: Dict[str, Dict[str, Any]] = {}
+
+# Активные чаты клиент–водитель через бота: user_id -> other_user_id
+ACTIVE_CHATS: Dict[int, int] = {}
 
 # ---------- GOOGLE SHEETS ----------
 from google.oauth2.service_account import Credentials
@@ -205,6 +208,7 @@ async def set_commands(app: Application) -> None:
             BotCommand("contact", "Связаться с диспетчером"),
             BotCommand("cancel", "Отмена"),
             BotCommand("ai", "AI-чат для диспетчера"),
+            BotCommand("endchat", "Завершить чат клиент–водитель"),
         ]
     )
 
@@ -311,7 +315,7 @@ async def ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     }
 
     try:
-        import requests  # ещё раз для mypy/линтеров, но это ок
+        import requests
         resp = requests.post(
             "https://api.openai.com/v1/chat/completions",
             headers=headers,
@@ -522,7 +526,7 @@ async def confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
-# ---------- КНОПКИ ВОДИТЕЛЕЙ ----------
+# ---------- КНОПКИ ВОДИТЕЛЕЙ (взять / отменить / на месте) ----------
 async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик кнопок в группе водителей и в ЛС водителя: взять/отменить/на месте."""
     query = update.callback_query
@@ -571,7 +575,7 @@ async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
         except Exception:
             pass
 
-        # Личные сообщения водителю (важно: водитель должен сначала нажать /start бота в ЛС!)
+        # Личные сообщения водителю (водитель общается с ботом)
         dm_text = (
             f"Вы приняли заказ #{order_id}\n\n"
             f"📍 Откуда: {order.get('pickup')}\n"
@@ -579,7 +583,8 @@ async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
             f"🚘 Класс: {order.get('car_class')}  ({order.get('approx_price')})\n"
             f"⏰ Время: {order.get('time')}\n"
             f"👥 Пассажиров: {order.get('passengers')}\n\n"
-            f"Личные данные клиента скрыты. Дальнейшие инструкции выдаст диспетчер."
+            f"Личные данные клиента скрыты. "
+            f"После прибытия нажмите «🚗 На месте», и откроется чат с клиентом через бота."
         )
         keyboard = InlineKeyboardMarkup(
             [
@@ -662,7 +667,7 @@ async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
             except Exception as e:
                 log.error("Не удалось вернуть заказ в группу водителей: %s", e)
 
-    # Водитель на месте (демо-оплата)
+    # Водитель на месте — включаем чат через бота
     elif data.startswith("drv_arrived:"):
         order_id = data.split(":", 1)[1]
         order = ORDERS_CACHE.get(order_id)
@@ -688,24 +693,95 @@ async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
             driver_name=order.get("driver_name"),
         )
 
-        # ДЕМО-ОПЛАТА: отправляем клиенту сообщение, без реальных платежей
         client_id = order.get("user_id")
+
+        # Сообщаем клиенту (через бота)
         if client_id:
             try:
                 await context.bot.send_message(
                     chat_id=int(client_id),
                     text=(
-                        "🚗 Ваш водитель на месте.\n"
-                        "В ближайшем будущем здесь появится кнопка для оплаты поездки 💳 (демо-версия)."
+                        "🚗 Ваш водитель на месте.\n\n"
+                        "Сейчас откроется чат с водителем через бота. "
+                        "Пишите свои сообщения в этот чат — мы передадим их водителю, "
+                        "а его ответы — вам.\n"
+                        "Телефоны и личные контакты остаются скрыты."
                     ),
                 )
             except Exception as e:
                 log.error("Не смог отправить сообщение клиенту: %s", e)
 
+        # Сообщаем водителю и подключаем чат
         try:
-            await query.edit_message_text("Отметили: вы на месте. Ожидаем клиента.")
+            await query.edit_message_text(
+                "Отметили: вы на месте.\n\n"
+                "Теперь это чат с клиентом через бота.\n"
+                "Пишите сюда — сообщения будут уходить клиенту.\n"
+                "Команда /endchat — завершить диалог."
+            )
         except Exception:
             pass
+
+        # Регистрируем чат клиент–водитель в ACTIVE_CHATS
+        if client_id:
+            ACTIVE_CHATS[driver.id] = int(client_id)
+            ACTIVE_CHATS[int(client_id)] = driver.id
+            log.info("Открыт чат через бота: driver %s <-> client %s", driver.id, client_id)
+
+
+# ---------- ЗАВЕРШЕНИЕ ЧАТА ----------
+async def endchat_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /endchat — завершает чат клиент–водитель через бота для обеих сторон."""
+    user_id = update.effective_user.id
+    other_id = ACTIVE_CHATS.get(user_id)
+
+    if not other_id:
+        await update.message.reply_text("У вас сейчас нет активного чата через бота.")
+        return
+
+    # Удаляем связи с обеих сторон
+    ACTIVE_CHATS.pop(user_id, None)
+    ACTIVE_CHATS.pop(other_id, None)
+
+    # Сообщаем обоим
+    try:
+        await context.bot.send_message(
+            chat_id=other_id,
+            text="Диалог через бота завершён одной из сторон.",
+        )
+    except Exception as e:
+        log.error("Не удалось уведомить вторую сторону при endchat: %s", e)
+
+    await update.message.reply_text("Вы завершили диалог через бота.")
+
+
+# ---------- РЕЛЕЙ ЧАТА ЧЕРЕЗ БОТА ----------
+async def relay_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Если пользователь участвует в ACTIVE_CHATS, пересылаем его сообщения второй стороне.
+    Телефоны и контакты остаются скрыты: пересылается только текст.
+    """
+    if not update.message or not update.message.text:
+        return
+
+    user_id = update.effective_user.id
+    text = update.message.text
+
+    # Не перехватываем команды (начинаются с /)
+    if text.startswith("/"):
+        return
+
+    other_id = ACTIVE_CHATS.get(user_id)
+    if not other_id:
+        return
+
+    try:
+        await context.bot.send_message(
+            chat_id=other_id,
+            text=text,
+        )
+    except Exception as e:
+        log.error("Ошибка при пересылке сообщения через чат бота: %s", e)
 
 
 # ---------- РОУТИНГ ----------
@@ -720,6 +796,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("contact", contact_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("ai", ai_cmd))
+    app.add_handler(CommandHandler("endchat", endchat_cmd))
 
     # разговор заказов
     conv = ConversationHandler(
@@ -752,7 +829,7 @@ def build_app() -> Application:
             CONFIRM: [
                 CallbackQueryHandler(confirm_cb, pattern="^(confirm|cancel)$"),
             ],
-        },
+        ],
         fallbacks=[
             CommandHandler("cancel", cancel_cmd),
             MessageHandler(filters.Regex("^❌ Отмена$"), cancel_cmd),
@@ -764,11 +841,14 @@ def build_app() -> Application:
     # кнопки водителей
     app.add_handler(CallbackQueryHandler(driver_orders_callback, pattern=r"^drv_"))
 
-    # кнопки меню
+    # Кнопки меню
     app.add_handler(MessageHandler(filters.Regex("^💰 Тарифы$"), price_cmd))
     app.add_handler(MessageHandler(filters.Regex("^📌 Статус$"), status_cmd))
     app.add_handler(MessageHandler(filters.Regex("^☎️ Контакт$"), contact_cmd))
     app.add_handler(MessageHandler(filters.Regex("^❌ Отмена$"), cancel_cmd))
+
+    # Релей чата через бота — в самом конце, чтобы не мешать другим хендлерам
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, relay_chat))
 
     app.post_init = set_commands
     return app
