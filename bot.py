@@ -246,29 +246,53 @@ def ai_chat(system_prompt: str, user_prompt: str, max_tokens: int = 300) -> str 
 
 def ai_normalize_time(user_text: str) -> str:
     """
-    Нормализуем дату/время из текста клиента.
-    Пример: «завтра в 10» -> «завтра 10:00» или «15.11 10:00».
-    Возвращаем короткую строку, пригодную для показа клиенту.
+    Преобразует фразы типа:
+    - «сейчас»
+    - «в 10»
+    - «сегодня в 19:30»
+    - «завтра в 10»
+    - «послезавтра в 9»
+    в формат: 'DD.MM HH:MM'
+
+    Если не получилось распознать — возвращаем исходный текст.
     """
-    if not OPENAI_API_KEY:
-        return user_text
+    txt = (user_text or "").strip()
+    if not txt:
+        return txt
 
-    system_prompt = (
-        "Ты помощник диспетчера такси. "
-        "Твоя задача — ПРЕОБРАЗОВАТЬ неформальное описание даты/времени клиента "
-        "в короткую, понятную запись.\n\n"
-        "Правила формата:\n"
-        "1) Если дата сегодня — пиши только «сегодня HH:MM» (24-часовой формат).\n"
-        "2) Если дата завтра — «завтра HH:MM».\n"
-        "3) Если другая дата — «DD.MM HH:MM».\n"
-        "4) Если клиент не указал время — используй «в ближайшее время».\n"
-        "5) Никаких объяснений, только итоговая строка.\n"
-    )
+    lower = txt.lower()
+    now = datetime.now()
 
-    result = ai_chat(system_prompt, user_text, max_tokens=30)
-    if not result:
-        return user_text
-    return result.replace("\n", " ").strip()
+    # Определяем дату
+    if "послезавтра" in lower:
+        target_date = now + timedelta(days=2)
+    elif "завтра" in lower:
+        target_date = now + timedelta(days=1)
+    else:
+        # считаем, что по умолчанию речь про сегодня
+        target_date = now
+
+    # Ищем время HH:MM или HH.MM
+    import re
+    m = re.search(r"(\d{1,2})[:\.](\d{1,2})", lower)
+    if m:
+        hh = int(m.group(1))
+        mm = int(m.group(2))
+    else:
+        # Пробуем формат «в 10» / «к 9»
+        m2 = re.search(r"\b(\d{1,2})\b", lower)
+        if m2:
+            hh = int(m2.group(1))
+            mm = 0
+        else:
+            # Время не нашли — возвращаем оригинал
+            return txt
+
+    # Небольшая защита от бреда
+    hh = max(0, min(23, hh))
+    mm = max(0, min(59, mm))
+
+    return f"{target_date:%d.%m} {hh:02d}:{mm:02d}"
 
 
 # ---------- КОНСТАНТЫ СОСТОЯНИЙ ----------
