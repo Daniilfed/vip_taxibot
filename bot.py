@@ -792,13 +792,25 @@ async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
                 pass
             return
 
-        # записываем водителя и проверяем его класс по таблице drivers
+                # ищем водителя в таблице drivers
         driver_info = get_driver_info(driver.id)
+
+        # если есть таблица drivers и записи нет — запретить брать заказ
+        if DRIVERS_SHEET and not driver_info:
+            await query.answer(
+                "Вы не зарегистрированы как водитель VIP Taxi.\n"
+                "Обратитесь к администратору, чтобы добавить вас в таблицу drivers.",
+                show_alert=True,
+            )
+            return
+
+        # проверяем соответствие класса машины заказу
         if driver_info and driver_info.get("car_class"):
             order_car = order.get("car_class")
             if driver_info["car_class"] != order_car:
                 await query.answer(
-                    f"Этот заказ только для класса: {order_car}", show_alert=True
+                    f"Этот заказ только для класса: {order_car}",
+                    show_alert=True,
                 )
                 return
 
