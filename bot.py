@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# VIP Taxi Bot — Google Sheets, бронирование заказов, AI-диспетчер
+# VIP Taxi Bot — Google Sheets, бронирование заказов, AI-диспетчер, регистрация водителей с фото
 
 import os
 import json
@@ -67,7 +67,8 @@ credentials = Credentials.from_service_account_info(
     ],
 )
 gc = gspread.authorize(credentials)
-sheet = gc.open("orders").sheet1
+sh = gc.open("orders")
+sheet = sh.sheet1
 
 # Столбцы:
 # A: order_id
@@ -84,9 +85,33 @@ sheet = gc.open("orders").sheet1
 # L: status
 # M: driver_id
 # N: driver_name
+# O: duration_min
+
+# Водители в отдельном листе "drivers"
+from gspread.exceptions import WorksheetNotFound
+
+try:
+    drivers_sheet = sh.worksheet("drivers")
+except WorksheetNotFound:
+    drivers_sheet = sh.add_worksheet(title="drivers", rows=200, cols=10)
+    # шапка
+    drivers_sheet.append_row(
+        [
+            "driver_id",
+            "username",
+            "full_name",
+            "car_class",
+            "car_number",
+            "photo1_file_id",
+            "photo2_file_id",
+            "photo3_file_id",
+            "created_at",
+        ]
+    )
 
 
 def save_order_to_sheet(order: dict) -> None:
+    """Запись заказа в Google Sheets."""
     try:
         sheet.append_row(
             [
@@ -104,15 +129,17 @@ def save_order_to_sheet(order: dict) -> None:
                 order.get("status", "new"),
                 str(order.get("driver_id") or ""),
                 order.get("driver_name") or "",
+                str(order.get("duration_min") or ""),
             ],
             value_input_option="USER_ENTERED",
         )
         log.info("Заказ записан в Google Sheets")
     except Exception as e:
-        log.error("Ошибка Google Sheets: %s", e)
+        log.error("Ошибка Google Sheets (save_order_to_sheet): %s", e)
 
 
 def find_order_row(order_id: str):
+    """Найти строку заказа по order_id (в колонке A)."""
     try:
         values = sheet.col_values(1)
         for idx, v in enumerate(values, start=1):
@@ -123,20 +150,94 @@ def find_order_row(order_id: str):
     return None
 
 
-def update_order_status_in_sheet(order_id: str, status: str, driver_id=None, driver_name=None):
+def update_order_status_in_sheet(order_id: str, status: str | None = None,
+                                 driver_id=None, driver_name=None,
+                                 duration_min: int | None = None):
+    """Обновить статус / водителя / длительность заказа."""
     row = find_order_row(order_id)
     if not row:
         return
     try:
-        sheet.update_cell(row, 12, status)
-        sheet.update_cell(row, 13, str(driver_id) if driver_id else "")
-        sheet.update_cell(row, 14, driver_name or "")
+        if status is not None:
+            sheet.update_cell(row, 12, status)
+        # driver_id
+        if driver_id is not None or driver_id == "":
+            sheet.update_cell(row, 13, str(driver_id) if driver_id else "")
+        # driver_name
+        if driver_name is not None:
+            sheet.update_cell(row, 14, driver_name or "")
+        # duration
+        if duration_min is not None:
+            sheet.update_cell(row, 15, str(duration_min))
     except Exception as e:
-        log.error("Ошибка обновления статуса: %s", e)
+        log.error("Ошибка обновления статуса заказа: %s", e)
 
 
-# --------- состояния разговора ---------
+# --------- работа с листом drivers ---------
+def save_driver_profile(profile: dict) -> None:
+    """Создать или обновить профиль водителя в листе drivers."""
+    driver_id_str = str(profile.get("driver_id"))
+    try:
+        values = drivers_sheet.col_values(1)
+        row_idx = None
+        for idx, v in enumerate(values, start=1):
+            if v == driver_id_str:
+                row_idx = idx
+                break
+
+        row = [
+            driver_id_str,
+            profile.get("username") or "",
+            profile.get("full_name") or "",
+            profile.get("car_class") or "",
+            profile.get("car_number") or "",
+            profile.get("photo1_file_id") or "",
+            profile.get("photo2_file_id") or "",
+            profile.get("photo3_file_id") or "",
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        ]
+
+        if row_idx:
+            # Обновляем строку
+            drivers_sheet.update(f"A{row_idx}:I{row_idx}", [row])
+        else:
+            drivers_sheet.append_row(row, value_input_option="USER_ENTERED")
+
+        log.info("Профиль водителя сохранён/обновлён в Google Sheets")
+
+    except Exception as e:
+        log.error("Ошибка сохранения профиля водителя: %s", e)
+
+
+def get_driver_profile(driver_id: int):
+    """Вернуть профиль водителя по его Telegram ID из листа drivers."""
+    driver_id_str = str(driver_id)
+    try:
+        values = drivers_sheet.get_all_values()
+        # первая строка — заголовки
+        for row in values[1:]:
+            if not row:
+                continue
+            if row[0] == driver_id_str:
+                return {
+                    "driver_id": row[0],
+                    "username": row[1],
+                    "full_name": row[2],
+                    "car_class": row[3],
+                    "car_number": row[4],
+                    "photo1_file_id": row[5],
+                    "photo2_file_id": row[6],
+                    "photo3_file_id": row[7],
+                }
+    except Exception as e:
+        log.error("Ошибка чтения профиля водителя: %s", e)
+    return None
+
+
+# --------- состояния разговоров ---------
 PICKUP, DEST, CAR, TIME, HOURS, CONTACT, CONFIRM = range(7)
+
+DR_NAME, DR_CAR_NUM, DR_CAR_CLASS, DR_PHOTO1, DR_PHOTO2, DR_PHOTO3 = range(100, 106)
 
 
 # --------- вспомогательные функции ---------
@@ -145,6 +246,7 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
         [
             ["🔔 Заказ", "💰 Тарифы"],
             ["📌 Статус", "☎️ Контакт"],
+            ["📷 Фото машины"],
             ["❌ Отмена"],
         ],
         resize_keyboard=True,
@@ -152,6 +254,16 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
 
 
 def cars_kb() -> ReplyKeyboardMarkup:
+    rows = [
+        ["Maybach W223", "Maybach W222"],
+        ["S-Class W223", "S-Class W222"],
+        ["Business", "Minivan"],
+        ["❌ Отмена"],
+    ]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=True)
+
+
+def driver_car_class_kb() -> ReplyKeyboardMarkup:
     rows = [
         ["Maybach W223", "Maybach W222"],
         ["S-Class W223", "S-Class W222"],
@@ -230,6 +342,14 @@ def calc_price(car_class: str, hours: int, destination: str) -> tuple[int, str]:
     return total, txt
 
 
+def parse_hours(text: str) -> int:
+    text = text.lower().strip()
+    for h in [1, 2, 3, 4, 5]:
+        if str(h) in text:
+            return h
+    return 1
+
+
 # --------- команды ---------
 async def set_commands(app: Application) -> None:
     await app.bot.set_my_commands(
@@ -242,6 +362,8 @@ async def set_commands(app: Application) -> None:
             BotCommand("contact", "Связаться с диспетчером"),
             BotCommand("cancel", "Отмена"),
             BotCommand("ai", "AI-чат для диспетчера"),
+            BotCommand("setdriver", "Регистрация/редактирование профиля водителя"),
+            BotCommand("carphoto", "Показать фото машины (при назначенном водителе)"),
         ]
     )
 
@@ -360,7 +482,7 @@ async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     }
     kb = ReplyKeyboardMarkup(
         [
-            [KeyboardButton("📍 Выбрать точку подачи на карте", request_location=True)],
+            [KeyboardButton("📍 Отправить мою геолокацию", request_location=True)],
             ["❌ Отмена"],
         ],
         resize_keyboard=True,
@@ -369,8 +491,9 @@ async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     await update.message.reply_text(
         "Укажите адрес подачи.\n\n"
         "Можно:\n"
-        "• Нажать кнопку «📍 Выбрать точку подачи на карте» и перетащить метку на нужное место.\n"
-        "• Или просто отправить адрес текстом.",
+        "• Нажать кнопку «📍 Отправить мою геолокацию» (если вы на точке подачи).\n"
+        "• Или просто отправить адрес текстом.\n"
+        "Также можно через скрепку 📎 → «Геопозиция» и выбрать точку на карте.",
         reply_markup=kb,
     )
     return PICKUP
@@ -431,14 +554,6 @@ async def time_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return HOURS
 
 
-def parse_hours(text: str) -> int:
-    text = text.lower().strip()
-    for h in [1, 2, 3, 4, 5]:
-        if str(h) in text:
-            return h
-    return 1
-
-
 async def hours_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     hours = parse_hours(update.message.text)
     context.user_data["order"]["hours"] = hours
@@ -475,6 +590,7 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     hours = int(o.get("hours", 1))
     _, price_text = calc_price(o.get("car_class"), hours, o.get("destination", ""))
     o["approx_price_text"] = price_text
+    o["duration_min"] = None  # пока поездка не началась
 
     text = (
         "<b>Проверьте заказ:</b>\n"
@@ -521,7 +637,7 @@ async def confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     await q.edit_message_text("Заказ принят. Водитель свяжется с вами.")
 
-    # в группу водителей
+    # отправка в группу водителей
     try:
         admin_id = int(ADMIN_CHAT_ID) if ADMIN_CHAT_ID else None
     except ValueError:
@@ -581,12 +697,32 @@ async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
                 pass
             return
 
-        if order.get("status") in ("assigned", "arrived", "finished"):
+        if order.get("status") in ("assigned", "ongoing", "arrived", "finished"):
             await query.answer("Этот заказ уже забрал другой водитель.", show_alert=True)
             try:
                 await query.message.delete()
             except Exception:
                 pass
+            return
+
+        # проверяем профиль водителя и соответствие класса
+        profile = get_driver_profile(driver.id)
+        if not profile:
+            await query.answer(
+                "Вы ещё не зарегистрированы как водитель.\n"
+                "Отправьте команду /setdriver в личку боту и заполните профиль.",
+                show_alert=True,
+            )
+            return
+
+        driver_class = profile.get("car_class")
+        order_class = order.get("car_class")
+        if driver_class != order_class:
+            await query.answer(
+                f"Этот заказ только для класса: {order_class}.\n"
+                f"Ваш класс в профиле: {driver_class or 'не указан'}.",
+                show_alert=True,
+            )
             return
 
         order["status"] = "assigned"
@@ -697,6 +833,7 @@ async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
                 log.error("Не удалось вернуть заказ в группу водителей: %s", e)
 
     elif data.startswith("drv_arrived:"):
+        from time import time as now_ts
         order_id = data.split(":", 1)[1]
         order = ORDERS_CACHE.get(order_id)
         if not order:
@@ -709,39 +846,270 @@ async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
             )
             return
 
-        order["status"] = "arrived"
+        order["status"] = "ongoing"
+        order["ride_start_ts"] = now_ts()
         ORDERS_CACHE[order_id] = order
 
         update_order_status_in_sheet(
             order_id=order_id,
-            status="arrived",
+            status="ongoing",
             driver_id=order.get("driver_id"),
             driver_name=order.get("driver_name"),
         )
 
         client_id = order.get("user_id")
         if client_id:
+            keyboard_client = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "✅ Завершить поездку", callback_data=f"finish_order:{order_id}"
+                        )
+                    ]
+                ]
+            )
             try:
                 await context.bot.send_message(
                     chat_id=int(client_id),
                     text=(
                         "🚗 Ваш водитель на месте.\n"
-                        "В ближайшем будущем здесь появится кнопка для оплаты поездки 💳 (демо-версия)."
+                        "После окончания поездки можно нажать «Завершить поездку»."
                     ),
+                    reply_markup=keyboard_client,
                 )
             except Exception as e:
                 log.error("Не смог отправить сообщение клиенту: %s", e)
 
+        keyboard_driver = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "✅ Завершить поездку", callback_data=f"finish_order:{order_id}"
+                    )
+                ]
+            ]
+        )
         try:
-            await query.edit_message_text("Отметили: вы на месте. Ожидаем клиента.")
+            await query.edit_message_text(
+                "Отметили: вы на месте. Таймер запущен.\n"
+                "После окончания поездки нажмите «Завершить поездку».",
+                reply_markup=keyboard_driver,
+            )
         except Exception:
             pass
 
 
-# --------- приложение ---------
+# --------- завершение поездки (кнопка клиента/водителя) ---------
+async def finish_order_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from time import time as now_ts
+
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    order_id = data.split(":", 1)[1]
+
+    order = ORDERS_CACHE.get(order_id)
+    if not order:
+        await query.answer("Заказ не найден.", show_alert=True)
+        return
+
+    if order.get("status") == "finished":
+        await query.edit_message_text(
+            f"Поездка по заказу #{order_id} уже завершена."
+        )
+        return
+
+    start_ts = order.get("ride_start_ts")
+    if start_ts:
+        duration_min = int((now_ts() - start_ts) / 60) or 1
+    else:
+        duration_min = 0
+
+    order["status"] = "finished"
+    order["duration_min"] = duration_min
+    ORDERS_CACHE[order_id] = order
+
+    update_order_status_in_sheet(
+        order_id=order_id,
+        status="finished",
+        driver_id=order.get("driver_id"),
+        driver_name=order.get("driver_name"),
+        duration_min=duration_min,
+    )
+
+    msg = (
+        f"Поездка по заказу #{order_id} завершена.\n"
+        f"Время в пути: {duration_min} мин."
+    )
+
+    client_id = order.get("user_id")
+    driver_id = order.get("driver_id")
+
+    # уведомляем обоих
+    if client_id:
+        try:
+            await context.bot.send_message(chat_id=int(client_id), text=msg)
+        except Exception as e:
+            log.error("Не смог отправить сообщение клиенту при завершении: %s", e)
+
+    if driver_id:
+        try:
+            await context.bot.send_message(chat_id=int(driver_id), text=msg)
+        except Exception as e:
+            log.error("Не смог отправить сообщение водителю при завершении: %s", e)
+
+    try:
+        await query.edit_message_text(msg)
+    except Exception:
+        pass
+
+
+# --------- регистрация водителя с фото ---------
+async def setdriver_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Запуск регистрации/редактирования профиля водителя."""
+    user = update.effective_user
+    context.user_data["driver_reg"] = {
+        "driver_id": user.id,
+        "username": f"@{user.username}" if user.username else "",
+        "full_name": user.full_name,
+    }
+    await update.message.reply_text(
+        "Регистрация водителя.\n\n"
+        "1️⃣ Напишите, как вас показывать клиенту (имя/имя и фамилия).",
+        reply_markup=ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True),
+    )
+    return DR_NAME
+
+
+async def dr_name_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    name = update.message.text.strip()
+    context.user_data["driver_reg"]["full_name"] = name
+    await update.message.reply_text(
+        "2️⃣ Укажите госномер автомобиля (например: А777АА777).",
+        reply_markup=ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True),
+    )
+    return DR_CAR_NUM
+
+
+async def dr_car_num_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    car_number = update.message.text.strip()
+    context.user_data["driver_reg"]["car_number"] = car_number
+    await update.message.reply_text(
+        "3️⃣ Выберите класс автомобиля.",
+        reply_markup=driver_car_class_kb(),
+    )
+    return DR_CAR_CLASS
+
+
+async def dr_car_class_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    car_class = update.message.text.strip()
+    if car_class not in HOURLY_PRICES:
+        await update.message.reply_text(
+            "Пожалуйста, выберите класс кнопкой снизу.",
+            reply_markup=driver_car_class_kb(),
+        )
+        return DR_CAR_CLASS
+    context.user_data["driver_reg"]["car_class"] = car_class
+    await update.message.reply_text(
+        "4️⃣ Отправьте фото автомобиля спереди.",
+        reply_markup=ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True),
+    )
+    return DR_PHOTO1
+
+
+async def dr_photo1_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message.photo:
+        await update.message.reply_text("Нужно отправить именно фото, а не файл. Попробуйте ещё раз.")
+        return DR_PHOTO1
+    file_id = update.message.photo[-1].file_id
+    context.user_data["driver_reg"]["photo1_file_id"] = file_id
+    await update.message.reply_text("5️⃣ Теперь отправьте фото автомобиля сбоку.")
+    return DR_PHOTO2
+
+
+async def dr_photo2_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message.photo:
+        await update.message.reply_text("Нужно отправить именно фото. Попробуйте ещё раз.")
+        return DR_PHOTO2
+    file_id = update.message.photo[-1].file_id
+    context.user_data["driver_reg"]["photo2_file_id"] = file_id
+    await update.message.reply_text("6️⃣ И последнее — фото салона.")
+    return DR_PHOTO3
+
+
+async def dr_photo3_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message.photo:
+        await update.message.reply_text("Нужно отправить именно фото. Попробуйте ещё раз.")
+        return DR_PHOTO3
+    file_id = update.message.photo[-1].file_id
+    reg = context.user_data.get("driver_reg", {})
+    reg["photo3_file_id"] = file_id
+
+    save_driver_profile(reg)
+
+    await update.message.reply_text(
+        "Профиль водителя сохранён.\n"
+        "Теперь при назначении вас на заказ клиент сможет увидеть фото автомобиля.",
+        reply_markup=main_menu_kb(),
+    )
+    context.user_data.pop("driver_reg", None)
+    return ConversationHandler.END
+
+
+# --------- фото машины для клиента ---------
+async def car_photo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показать клиенту фото машины по его активному заказу (если есть водитель с фото)."""
+    user_id = update.effective_user.id
+
+    # ищем заказ этого пользователя с назначенным водителем
+    current_order = None
+    for o in ORDERS_CACHE.values():
+        if o.get("user_id") == user_id and o.get("driver_id"):
+            current_order = o
+
+    if not current_order:
+        await update.message.reply_text(
+            "Фото машины будет доступно после назначения водителя на ваш заказ."
+        )
+        return
+
+    driver_id = current_order.get("driver_id")
+    profile = get_driver_profile(driver_id)
+    if not profile:
+        await update.message.reply_text(
+            "Водитель ещё не загрузил фото автомобиля. Попросите диспетчера уточнить."
+        )
+        return
+
+    text_header = (
+        "Ваш водитель:\n"
+        f"🧑‍✈️ {profile.get('full_name') or profile.get('username')}\n"
+        f"🚘 {profile.get('car_class')}\n"
+        f"🔢 Номер авто: {profile.get('car_number')}"
+    )
+    await update.message.reply_text(text_header)
+
+    photos_ids = [
+        profile.get("photo1_file_id"),
+        profile.get("photo2_file_id"),
+        profile.get("photo3_file_id"),
+    ]
+    for pid in photos_ids:
+        if pid:
+            try:
+                await update.message.bot.send_photo(
+                    chat_id=update.effective_chat.id,
+                    photo=pid,
+                )
+            except Exception as e:
+                log.error("Не удалось отправить фото машины: %s", e)
+
+
+# --------- роутинг ---------
 def build_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("price", price_cmd))
@@ -749,8 +1117,10 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("contact", contact_cmd))
     app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("ai", ai_cmd))
+    app.add_handler(CommandHandler("carphoto", car_photo_cmd))
 
-    conv = ConversationHandler(
+    # разговор по заказу
+    conv_order = ConversationHandler(
         entry_points=[
             CommandHandler("order", order_start),
             MessageHandler(filters.Regex("^🔔 Заказ$"), order_start),
@@ -780,20 +1150,58 @@ def build_app() -> Application:
             CONFIRM: [
                 CallbackQueryHandler(confirm_cb, pattern="^(confirm|cancel)$"),
             ],
-        },
+        ],
         fallbacks=[
             CommandHandler("cancel", cancel_cmd),
             MessageHandler(filters.Regex("^❌ Отмена$"), cancel_cmd),
         ],
         allow_reentry=True,
     )
-    app.add_handler(conv)
+    app.add_handler(conv_order)
 
+    # разговор по регистрации водителя
+    conv_driver = ConversationHandler(
+        entry_points=[CommandHandler("setdriver", setdriver_start)],
+        states={
+            DR_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, dr_name_set),
+            ],
+            DR_CAR_NUM: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, dr_car_num_set),
+            ],
+            DR_CAR_CLASS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, dr_car_class_set),
+            ],
+            DR_PHOTO1: [
+                MessageHandler(filters.PHOTO, dr_photo1_set),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, dr_photo1_set),
+            ],
+            DR_PHOTO2: [
+                MessageHandler(filters.PHOTO, dr_photo2_set),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, dr_photo2_set),
+            ],
+            DR_PHOTO3: [
+                MessageHandler(filters.PHOTO, dr_photo3_set),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, dr_photo3_set),
+            ],
+        ],
+        fallbacks=[
+            CommandHandler("cancel", cancel_cmd),
+            MessageHandler(filters.Regex("^❌ Отмена$"), cancel_cmd),
+        ],
+        allow_reentry=True,
+    )
+    app.add_handler(conv_driver)
+
+    # колбэки для водителей и завершения заказа
     app.add_handler(CallbackQueryHandler(driver_orders_callback, pattern=r"^drv_"))
+    app.add_handler(CallbackQueryHandler(finish_order_cb, pattern=r"^finish_order:"))
 
+    # Кнопки меню
     app.add_handler(MessageHandler(filters.Regex("^💰 Тарифы$"), price_cmd))
     app.add_handler(MessageHandler(filters.Regex("^📌 Статус$"), status_cmd))
     app.add_handler(MessageHandler(filters.Regex("^☎️ Контакт$"), contact_cmd))
+    app.add_handler(MessageHandler(filters.Regex("^📷 Фото машины$"), car_photo_cmd))
     app.add_handler(MessageHandler(filters.Regex("^❌ Отмена$"), cancel_cmd))
 
     app.post_init = set_commands
