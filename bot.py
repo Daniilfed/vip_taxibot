@@ -4,8 +4,9 @@
 import os
 import json
 import logging
+import re
 from uuid import uuid4
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from telegram import (
     Update,
@@ -38,7 +39,7 @@ log = logging.getLogger("vip_taxi_bot")
 BRAND_NAME = "VIP taxi"
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")  # группа водителей
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 SHEET_ID = os.environ.get("SHEET_ID")
 
@@ -55,11 +56,11 @@ PRICES = {
     "Minivan": 3000,
 }
 
-# аэропорты (фикс, не дороже 2-х часов аренды)
-AIRPORT_PRICES = {
-    "Sheremetyevo": 0,   # 0 -> считается как 2 часа от выбранного класса
-    "Domodedovo": 0,
-    "Vnukovo": 0,
+# аэропорты: фиксированно считаем как 2 часа аренды
+AIRPORT_KEYWORDS = {
+    "sheremetyevo": ["шереметьево", "svo"],
+    "domodedovo": ["домодедово", "dme"],
+    "vnukovo": ["внуково", "vko"],
 }
 
 # кэш заказов в памяти
@@ -79,6 +80,103 @@ gc = gspread.authorize(credentials)
 spreadsheet = gc.open_by_key(SHEET_ID)
 ORDERS_SHEET = spreadsheet.worksheet("Лист1")
 DRIVERS_SHEET = spreadsheet.worksheet("drivers")
+
+
+# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДАТЫ/ВРЕМЕНИ ----------
+
+def normalize_time_text(text: str) -> str:
+    """
+    Преобразует фразы типа «завтра в 10», «сегодня 19:30», «в пятницу в 8»
+    в формат 'ДД.MM.ГГГГ ЧЧ:ММ'. Если не смогли распарсить — отдаём исходный текст.
+    """
+    try:
+        t = text.lower().strip()
+        now = datetime.now()
+        target_date = None
+
+        # относительные дни
+        if "послезавтра" in t:
+            target_date = now.date() + timedelta(days=2)
+        elif "завтра" in t:
+            target_date = now.date() + timedelta(days=1)
+        elif "сегодня" in t:
+            target_date = now.date()
+
+        # дни недели
+        if target_date is None:
+            weekdays = {
+                "понедельник": 0,
+                "вторник": 1,
+                "среду": 2,
+                "среда": 2,
+                "четверг": 3,
+                "пятницу": 4,
+                "пятница": 4,
+                "субботу": 5,
+                "суббота": 5,
+                "воскресенье": 6,
+                "воскресенье": 6,
+            }
+            for word, idx in weekdays.items():
+                if word in t:
+                    current_idx = now.weekday()
+                    delta = (idx - current_idx) % 7
+                    if delta == 0:
+                        delta = 7
+                    target_date = now.date() + timedelta(days=delta)
+                    break
+
+        # явная дата ДД.ММ(.ГГ)
+        if target_date is None:
+            m = re.search(r"(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?", t)
+            if m:
+                day = int(m.group(1))
+                month = int(m.group(2))
+                year = now.year
+                if m.group(3):
+                    year = int(m.group(3))
+                    if year < 100:
+                        year += 2000
+                try:
+                    target_date = datetime(year, month, day).date()
+                except ValueError:
+                    target_date = now.date()
+
+        if target_date is None:
+            target_date = now.date()
+
+        # время
+        m = re.search(r"(\d{1,2})[:.](\d{2})", t)
+        if m:
+            hour = int(m.group(1))
+            minute = int(m.group(2))
+        else:
+            m = re.search(r"\b(\d{1,2})\b", t)
+            if m:
+                hour = int(m.group(1))
+                minute = 0
+            else:
+                hour = now.hour
+                minute = now.minute
+
+        dt = datetime(target_date.year, target_date.month, target_date.day, hour, minute)
+        return dt.strftime("%d.%m.%Y %H:%M")
+    except Exception as e:
+        log.error("Ошибка нормализации времени '%s': %s", text, e)
+        return text
+
+
+def detect_airport(text: str | None) -> str | None:
+    """Определяем, есть ли в строке аэропорт."""
+    if not text:
+        return None
+    t = text.lower()
+    for code, words in AIRPORT_KEYWORDS.items():
+        for w in words:
+            if w in t:
+                return code
+    return None
+
 
 # ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ GOOGLE SHEETS ----------
 
@@ -173,21 +271,34 @@ def find_driver_row(driver_id: int):
 
 
 def get_driver_info(driver_id: int) -> dict | None:
-    """Считать данные водителя из листа drivers."""
+    """Считать данные водителя из листа drivers.
+
+    Формат строк:
+    A: driver_id
+    B: driver_name
+    C: car_class
+    D: plate
+    E: car_photo_file_ids (через |, до 3 штук)
+    F: rating
+    G: last_lat
+    H: last_lon
+    I: last_update
+    """
     row = find_driver_row(driver_id)
     if not row:
         return None
     try:
         values = DRIVERS_SHEET.row_values(row)
-        # driver_id, driver_name, car_class, plate, car_photo_file_id, rating, last_lat, last_lon, last_update
         while len(values) < 9:
             values.append("")
+        photos_raw = values[4] or ""
+        car_photos = [p for p in photos_raw.split("|") if p.strip()]
         return {
             "driver_id": values[0],
             "driver_name": values[1],
             "car_class": values[2],
             "plate": values[3],
-            "car_photo_file_id": values[4],
+            "car_photos": car_photos,
             "rating": values[5],
             "last_lat": values[6],
             "last_lon": values[7],
@@ -198,18 +309,19 @@ def get_driver_info(driver_id: int) -> dict | None:
         return None
 
 
-def upsert_driver(driver_id: int, driver_name: str, car_class: str, plate: str, photo_file_id: str):
-    """Создать/обновить запись водителя."""
+def upsert_driver(driver_id: int, driver_name: str, car_class: str, plate: str, photo_file_ids: list[str]):
+    """Создать/обновить запись водителя. Фото храним как 'id1|id2|id3' в одной ячейке."""
+    photos_str = "|".join(photo_file_ids) if photo_file_ids else ""
     row = find_driver_row(driver_id)
     try:
         if row:
             DRIVERS_SHEET.update(
                 f"A{row}:E{row}",
-                [[str(driver_id), driver_name, car_class, plate, photo_file_id]],
+                [[str(driver_id), driver_name, car_class, plate, photos_str]],
             )
         else:
             DRIVERS_SHEET.append_row(
-                [str(driver_id), driver_name, car_class, plate, photo_file_id, "", "", "", ""],
+                [str(driver_id), driver_name, car_class, plate, photos_str, "", "", "", ""],
                 value_input_option="USER_ENTERED",
             )
         log.info("Водитель %s обновлён/добавлен", driver_id)
@@ -330,7 +442,7 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
-# ---------- AI /ai (оставляем как есть, но можно улучшать промпт) ----------
+# ---------- AI /ai (оставляем как есть, но промпт улучшен) ----------
 
 async def ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     question = " ".join(context.args).strip()
@@ -395,6 +507,7 @@ async def setdriver_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     context.user_data["driver"] = {
         "driver_id": user.id,
         "driver_name": user.username or user.full_name,
+        "photos": [],
     }
     await update.message.reply_text(
         "Регистрация/обновление водителя.\n\n"
@@ -420,40 +533,71 @@ async def setdriver_class(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def setdriver_plate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["driver"]["plate"] = update.message.text.strip()
     await update.message.reply_text(
-        "Отправьте <b>фото вашей машины</b> (можно одним фото, где видно автомобиль).",
-        reply_markup=ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True),
+        "Отправьте <b>1–3 фото вашей машины</b> (можно по очереди).\n"
+        "После последнего фото напишите «Готово».",
+        reply_markup=ReplyKeyboardMarkup([["Готово", "❌ Отмена"]], resize_keyboard=True),
         parse_mode=ParseMode.HTML,
     )
     return DRV_PHOTO
 
 
-async def setdriver_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message.photo:
-        await update.message.reply_text("Это не фото. Пожалуйста, отправьте фото машины.")
-        return DRV_PHOTO
-
-    photo = update.message.photo[-1]
-    file_id = photo.file_id
+async def finish_driver_registration(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     d = context.user_data["driver"]
-    d["car_photo_file_id"] = file_id
+    photos = d.get("photos") or []
+    if not photos:
+        await update.message.reply_text("Сначала отправьте хотя бы одно фото машины.")
+        return DRV_PHOTO
 
     upsert_driver(
         driver_id=d["driver_id"],
         driver_name=d["driver_name"],
         car_class=d["car_class"],
         plate=d["plate"],
-        photo_file_id=file_id,
+        photo_file_ids=photos,
     )
 
     await update.message.reply_text(
         "Данные водителя сохранены.\n"
         f"Класс: {d['car_class']}\n"
         f"Номер авто: {d['plate']}\n"
+        f"Фото: {len(photos)} шт.\n"
         "Теперь вы сможете брать заказы только по своему классу.",
         reply_markup=main_menu_kb(),
     )
     context.user_data.pop("driver", None)
     return ConversationHandler.END
+
+
+async def setdriver_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    d = context.user_data.get("driver") or {}
+    photos: list[str] = d.setdefault("photos", [])
+
+    # Фото
+    if update.message.photo:
+        photo = update.message.photo[-1]
+        file_id = photo.file_id
+        if file_id not in photos:
+            photos.append(file_id)
+
+        if len(photos) < 3:
+            await update.message.reply_text(
+                f"Фото сохранено ({len(photos)}/3).\n"
+                "Можете отправить ещё фото или написать «Готово».",
+            )
+            return DRV_PHOTO
+        else:
+            # Уже 3 фото — завершаем автоматически
+            return await finish_driver_registration(update, context)
+
+    # Текст
+    text = (update.message.text or "").lower().strip()
+    if text.startswith("готов"):
+        return await finish_driver_registration(update, context)
+
+    await update.message.reply_text(
+        "Отправьте фото машины или напишите «Готово», когда закончите."
+    )
+    return DRV_PHOTO
 
 
 # ---------- ЗАКАЗ (обычный) ----------
@@ -465,6 +609,7 @@ async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         "username": f"@{update.effective_user.username}"
         if update.effective_user.username
         else update.effective_user.full_name,
+        "urgent": False,
     }
     context.user_data["order"] = o
 
@@ -518,7 +663,25 @@ async def car_choose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if car not in PRICES:
         await update.message.reply_text("Пожалуйста, выберите класс кнопкой.", reply_markup=cars_kb())
         return CAR
-    context.user_data["order"]["car_class"] = car
+    order = context.user_data["order"]
+    order["car_class"] = car
+
+    # если срочный заказ — не спрашиваем время и часы
+    if order.get("urgent"):
+        order["time"] = "Срочно (как можно быстрее)"
+        order["hours"] = 1
+        order["hours_text"] = "1 ч. (срочный)"
+        kb = ReplyKeyboardMarkup(
+            [[KeyboardButton("Поделиться телефоном", request_contact=True)], ["❌ Отмена"]],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        )
+        await update.message.reply_text(
+            "Оставьте контакт (имя и телефон), или поделитесь номером:",
+            reply_markup=kb,
+        )
+        return CONTACT
+
     await update.message.reply_text(
         "⏰ Когда подать автомобиль? (например: сейчас, 19:30, завтра 10:00)",
         reply_markup=ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True),
@@ -527,7 +690,11 @@ async def car_choose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def time_set(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["order"]["time"] = update.message.text.strip()
+    raw = update.message.text.strip()
+    norm = normalize_time_text(raw)
+    context.user_data["order"]["time"] = norm
+    context.user_data["order"]["time_raw"] = raw
+
     await update.message.reply_text(
         "На сколько часов нужна машина? Минимум 1 час. От 3 часов действует скидка.",
         reply_markup=hours_kb(),
@@ -576,8 +743,23 @@ async def contact_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     o = context.user_data["order"]
-    hours = o.get("hours", 1)
-    approx = format_price(o["car_class"], hours)
+
+    # Аэропорт?
+    airport_from = detect_airport(o.get("pickup"))
+    airport_to = detect_airport(o.get("destination"))
+    airport = airport_from or airport_to
+
+    if airport:
+        # фикс как 2 часа аренды
+        o["hours"] = 2
+        o["hours_text"] = "2 ч. (аэропорт)"
+        base = PRICES.get(o["car_class"], 0)
+        total = base * 2
+        approx = f"≈ {total:,.0f} ₽ за поездку (аэропорт, до 2 ч.)".replace(",", " ")
+    else:
+        hours = o.get("hours", 1)
+        approx = format_price(o["car_class"], hours)
+
     o["approx_price"] = approx
 
     text = (
@@ -636,7 +818,6 @@ async def confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         admin_id = ADMIN_CHAT_ID
 
     if admin_id:
-        hours = order.get("hours", 1)
         text_for_drivers = (
             f"🆕 Новый заказ #{order['order_id']}\n"
             f"📍 Откуда: {order.get('pickup')}\n"
@@ -676,9 +857,6 @@ async def urgent_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         if update.effective_user.username
         else update.effective_user.full_name,
         "urgent": True,
-        "time": "Сейчас",
-        "hours": 1,
-        "hours_text": "Срочный",
     }
     context.user_data["order"] = o
     kb = ReplyKeyboardMarkup(
@@ -1038,20 +1216,17 @@ async def chat_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def carphoto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
 
-    # ищем последний активный или последний завершённый заказ клиента
+    # ищем последний заказ клиента
     try:
         col_user = ORDERS_SHEET.col_values(2)  # user_id
         col_order = ORDERS_SHEET.col_values(1)
-        last_row = None
         last_order_id = None
         for idx in range(len(col_user) - 1, 0, -1):
             if col_user[idx] and str(col_user[idx]) == str(user_id):
-                last_row = idx + 1  # потому что col_values без заголовка? нет, с заголовком: idx=1 -> row=2
                 last_order_id = col_order[idx]
                 break
     except Exception as e:
         log.error("Ошибка поиска заказа для carphoto: %s", e)
-        last_row = None
         last_order_id = None
 
     if not last_order_id:
@@ -1065,7 +1240,7 @@ async def carphoto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     else:
         # читаем из листа
         try:
-            row_vals = ORDERS_SHEET.row_values(last_row)
+            row_vals = ORDERS_SHEET.row_values(find_order_row(last_order_id))
             if len(row_vals) >= 13 and row_vals[12]:
                 driver_id = int(row_vals[12])
         except Exception:
@@ -1087,13 +1262,21 @@ async def carphoto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"🧾 Номер авто: {info['plate'] or '—'}"
     )
 
-    if info["car_photo_file_id"]:
+    photos = info.get("car_photos") or []
+    if photos:
         try:
+            # первое фото с подписью
             await update.message.bot.send_photo(
                 chat_id=update.effective_chat.id,
-                photo=info["car_photo_file_id"],
+                photo=photos[0],
                 caption=text,
             )
+            # остальные без подписи
+            for p in photos[1:3]:
+                await update.message.bot.send_photo(
+                    chat_id=update.effective_chat.id,
+                    photo=p,
+                )
         except Exception as e:
             log.error("Ошибка отправки фото машины: %s", e)
             await update.message.reply_text(text)
@@ -1122,7 +1305,10 @@ def build_app() -> Application:
         states={
             DRV_CLASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, setdriver_class)],
             DRV_PLATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, setdriver_plate)],
-            DRV_PHOTO: [MessageHandler(filters.PHOTO, setdriver_photo)],
+            DRV_PHOTO: [
+                MessageHandler(filters.PHOTO, setdriver_photo),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, setdriver_photo),
+            ],
         },
         fallbacks=[
             CommandHandler("cancel", cancel_cmd),
