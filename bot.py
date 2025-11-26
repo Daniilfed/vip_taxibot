@@ -1223,10 +1223,10 @@ async def carphoto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         last_row = None
         last_order_id = None
 
-        # идём снизу вверх, ищем последнее совпадение по user_id
+        # идём снизу вверх, ищем первую строку с нашим user_id
         for idx in range(len(col_user) - 1, 0, -1):
             if col_user[idx] and str(col_user[idx]) == str(user_id):
-                last_row = idx + 1  # idx по списку -> номер строки в таблице
+                last_row = idx + 1  # индекс списка -> номер строки
                 last_order_id = col_order[idx]
                 break
     except Exception as e:
@@ -1240,18 +1240,19 @@ async def carphoto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    # пробуем взять driver_id из кеша, если нет — из таблицы
+    # пытаемся взять driver_id из кэша, если бот не перезапускался
     order = ORDERS_CACHE.get(last_order_id)
     driver_id = None
     if order:
         driver_id = order.get("driver_id")
     else:
+        # берём из таблицы (13-й столбец)
         try:
             row_vals = ORDERS_SHEET.row_values(last_row)
             if len(row_vals) >= 13 and row_vals[12]:
                 driver_id = int(row_vals[12])
         except Exception as e:
-            log.error("Ошибка чтения driver_id из таблицы: %s", e)
+            log.error("Ошибка чтения driver_id из таблицы для carphoto: %s", e)
             driver_id = None
 
     if not driver_id:
@@ -1262,9 +1263,7 @@ async def carphoto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     info = get_driver_info(driver_id)
     if not info:
-        await update.message.reply_text(
-            "Информация о водителе временно недоступна."
-        )
+        await update.message.reply_text("Информация о водителе временно недоступна.")
         return
 
     text = (
@@ -1274,32 +1273,22 @@ async def carphoto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"🧾 Номер авто: {info['plate'] or '—'}"
     )
 
-    # поддержка нескольких фото через разделитель |
-    file_ids_raw = (info.get("car_photo_file_id") or "").strip()
-    if not file_ids_raw:
-        await update.message.reply_text(text)
-        return
-
-    file_ids = [fid.strip() for fid in file_ids_raw.split("|") if fid.strip()]
-
-    try:
-        # первое фото с подписью
-        await context.bot.send_photo(
-            chat_id=update.effective_chat.id,
-            photo=file_ids[0],
-            caption=text,
-        )
-        # остальные без подписи (если есть)
-        for fid in file_ids[1:]:
+    file_id = info.get("car_photo_file_id")
+    if file_id:
+        try:
+            # ВАЖНО: используем context.bot, а не update.message.bot
             await context.bot.send_photo(
                 chat_id=update.effective_chat.id,
-                photo=fid,
+                photo=file_id,
+                caption=text,
             )
-    except Exception as e:
-        log.error("Ошибка отправки фото машины: %s", e)
-        await update.message.reply_text(text)
+            return
+        except Exception as e:
+            log.error("Ошибка отправки фото машины: %s", e)
 
-
+    # если что-то пошло не так — хотя бы текст
+    await update.message.reply_text(text)
+    
 # ---------- РОУТИНГ ----------
 
 def build_app() -> Application:
