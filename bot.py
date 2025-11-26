@@ -1281,9 +1281,13 @@ async def driver_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
             await query.edit_message_text("Вы отменили заказ. Он возвращён в общий список.")
         except Exception:
             pass
+                # возвращаем заказ в группу
+    try:
+        admin_id = int(ADMIN_CHAT_ID) if ADMIN_CHAT_ID else None
+    except ValueError:
+        admin_id = ADMIN_CHAT_ID
+            
 
-        # возвращаем заказ в группу
-        try:
-            admin_id = int(ADMIN_CHAT_ID) if ADMIN_CHAT_ID else None
-        except ValueError:
+
+
        
