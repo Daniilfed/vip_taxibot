@@ -1274,22 +1274,21 @@ def build_app() -> Application:
 
     # регистрация водителя
     drv_conv = ConversationHandler(
-        entry_points=[CommandHandler("setdriver", setdriver_start)],
-        states={
-            DRV_CLASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, setdriver_class)],
-            DRV_PLATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, setdriver_plate)],
-            DRV_PHOTO: [
-                MessageHandler(filters.PHOTO, setdriver_photo),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, setdriver_photo),
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel_cmd),
-            MessageHandler(filters.Regex("^❌ Отмена$"), cancel_cmd),
+    entry_points=[CommandHandler("setdriver", setdriver_start)],
+    states={
+        DRV_CLASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, setdriver_class)],
+        DRV_PLATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, setdriver_plate)],
+        DRV_PHOTO: [
+            MessageHandler(filters.PHOTO, setdriver_photo),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, setdriver_photo),
         ],
-        allow_reentry=True,
-    )
-    app.add_handler(drv_conv)
+    },
+    fallbacks=[
+        CommandHandler("cancel", cancel_cmd),
+        MessageHandler(filters.Regex("^❌ Отмена$"), cancel_cmd),
+    ],
+    allow_reentry=True,
+)
 
     # заказ (обычный + срочный)
     order_conv = ConversationHandler(
