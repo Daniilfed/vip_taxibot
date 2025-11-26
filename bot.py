@@ -1216,43 +1216,55 @@ async def chat_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def carphoto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
 
-    # ищем последний заказ клиента
+    # ищем последний заказ этого клиента
     try:
         col_user = ORDERS_SHEET.col_values(2)  # user_id
-        col_order = ORDERS_SHEET.col_values(1)
+        col_order = ORDERS_SHEET.col_values(1)  # order_id
+        last_row = None
         last_order_id = None
+
+        # идём снизу вверх, ищем последнее совпадение по user_id
         for idx in range(len(col_user) - 1, 0, -1):
             if col_user[idx] and str(col_user[idx]) == str(user_id):
+                last_row = idx + 1  # idx по списку -> номер строки в таблице
                 last_order_id = col_order[idx]
                 break
     except Exception as e:
         log.error("Ошибка поиска заказа для carphoto: %s", e)
+        last_row = None
         last_order_id = None
 
     if not last_order_id:
-        await update.message.reply_text("Информация о водителе временно недоступна. Попробуйте позже.")
+        await update.message.reply_text(
+            "Информация о водителе временно недоступна. Попробуйте позже."
+        )
         return
 
+    # пробуем взять driver_id из кеша, если нет — из таблицы
     order = ORDERS_CACHE.get(last_order_id)
     driver_id = None
     if order:
         driver_id = order.get("driver_id")
     else:
-        # читаем из листа
         try:
-            row_vals = ORDERS_SHEET.row_values(find_order_row(last_order_id))
+            row_vals = ORDERS_SHEET.row_values(last_row)
             if len(row_vals) >= 13 and row_vals[12]:
                 driver_id = int(row_vals[12])
-        except Exception:
+        except Exception as e:
+            log.error("Ошибка чтения driver_id из таблицы: %s", e)
             driver_id = None
 
     if not driver_id:
-        await update.message.reply_text("Водитель ещё не назначен или информация недоступна.")
+        await update.message.reply_text(
+            "Водитель ещё не назначен или информация недоступна."
+        )
         return
 
     info = get_driver_info(driver_id)
     if not info:
-        await update.message.reply_text("Информация о водителе временно недоступна.")
+        await update.message.reply_text(
+            "Информация о водителе временно недоступна."
+        )
         return
 
     text = (
@@ -1262,25 +1274,29 @@ async def carphoto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"🧾 Номер авто: {info['plate'] or '—'}"
     )
 
-    photos = info.get("car_photos") or []
-    if photos:
-        try:
-            # первое фото с подписью
-            await update.message.bot.send_photo(
+    # поддержка нескольких фото через разделитель |
+    file_ids_raw = (info.get("car_photo_file_id") or "").strip()
+    if not file_ids_raw:
+        await update.message.reply_text(text)
+        return
+
+    file_ids = [fid.strip() for fid in file_ids_raw.split("|") if fid.strip()]
+
+    try:
+        # первое фото с подписью
+        await context.bot.send_photo(
+            chat_id=update.effective_chat.id,
+            photo=file_ids[0],
+            caption=text,
+        )
+        # остальные без подписи (если есть)
+        for fid in file_ids[1:]:
+            await context.bot.send_photo(
                 chat_id=update.effective_chat.id,
-                photo=photos[0],
-                caption=text,
+                photo=fid,
             )
-            # остальные без подписи
-            for p in photos[1:3]:
-                await update.message.bot.send_photo(
-                    chat_id=update.effective_chat.id,
-                    photo=p,
-                )
-        except Exception as e:
-            log.error("Ошибка отправки фото машины: %s", e)
-            await update.message.reply_text(text)
-    else:
+    except Exception as e:
+        log.error("Ошибка отправки фото машины: %s", e)
         await update.message.reply_text(text)
 
 
