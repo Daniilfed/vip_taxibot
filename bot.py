@@ -44,12 +44,12 @@ ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")  # можно не исполь�
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")  # если понадобится
 SHEET_ID = os.environ.get("SHEET_ID")  # если будешь подключать таблицу
 
-# ТВОЙ ID ГРУППЫ ДЛЯ РЕГИСТРАЦИИ ВОДИТЕЛЕЙ
+# ID ГРУППЫ ДЛЯ РЕГИСТРАЦИИ ВОДИТЕЛЕЙ
 DRIVER_REG_CHAT_ID = -5062249297
 
 assert BOT_TOKEN, "BOT_TOKEN is required"
 
-# Пример тарифов (можешь убрать/поменять)
+# Пример тарифов (пока просто константа, можно не использовать)
 PRICES = {
     "Maybach W223": 7000,
     "Maybach W222": 4000,
@@ -87,7 +87,7 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
 
     if "Стать водителем" in text:
-        # Стартуем диалог регистрации
+        # Стартуем диалог регистрации (ConversationHandler перехватит)
         return await reg_driver_start(update, context)
 
     if "Заказать поездку" in text:
@@ -117,7 +117,7 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _normalize_phone(text: str) -> Optional[str]:
-    """Приводим номер к виду +7ХХХХХХХХХ"""
+    """Приводим номер к виду +7ХХХХХХХХХ."""
     import re
 
     digits = re.sub(r"\D", "", text or "")
@@ -348,8 +348,10 @@ async def driver_moderation_action(update: Update, context: ContextTypes.DEFAULT
         try:
             await context.bot.send_message(
                 chat_id=user_id,
-                text="🎉 Ваша заявка на регистрацию в VIP taxi *одобрена*.\n"
-                "Мы свяжемся с вами для дальнейших шагов.",
+                text=(
+                    "🎉 Ваша заявка на регистрацию в VIP taxi *одобрена*.\n"
+                    "Мы свяжемся с вами для дальнейших шагов."
+                ),
                 parse_mode="Markdown",
             )
         except Exception as e:
@@ -366,8 +368,10 @@ async def driver_moderation_action(update: Update, context: ContextTypes.DEFAULT
         try:
             await context.bot.send_message(
                 chat_id=user_id,
-                text="❌ Ваша заявка на регистрацию в VIP taxi *отклонена*.\n"
-                "Вы можете отправить новую заявку позже.",
+                text=(
+                    "❌ Ваша заявка на регистрацию в VIP taxi *отклонена*.\n"
+                    "Вы можете отправить новую заявку позже."
+                ),
                 parse_mode="Markdown",
             )
         except Exception as e:
@@ -386,7 +390,7 @@ def main() -> None:
     # /start
     application.add_handler(CommandHandler("start", start))
 
-    # регистрация водителей как отдельная команда
+    # регистрация водителей как отдельная команда / кнопка
     reg_conv = ConversationHandler(
         entry_points=[
             CommandHandler("reg_driver", reg_driver_start),
