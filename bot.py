@@ -507,7 +507,9 @@ async def ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Не удалось получить ответ от AI-диспетчера.")
 
 
-# ---------- РЕГИСТРАЦИЯ ВОДИТЕЛЯ /setdriver ----------
+# ---------- РЕГИСТРАЦИЯ ВОДИТЕЛЯ (/setdriver) ----------
+
+DRV_CLASS, DRV_PLATE, DRV_PHOTO = range(100, 103)
 
 async def setdriver_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
@@ -517,42 +519,51 @@ async def setdriver_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "photos": [],
     }
     await update.message.reply_text(
-        "Регистрация/обновление водителя.\n\n"
-        "Выберите класс авто, на котором вы работаете:",
+        "Регистрация водителя.\n\nВыберите класс авто:",
         reply_markup=cars_kb(),
     )
     return DRV_CLASS
 
 
 async def setdriver_class(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    car_class = update.message.text.strip()
-    if car_class not in PRICES:
-        await update.message.reply_text("Пожалуйста, выберите класс кнопкой.", reply_markup=cars_kb())
+    text = update.message.text.strip()
+
+    if text in ("❌ Отмена", "Отмена"):
+        return await cancel_cmd(update, context)
+
+    if text not in PRICES:
+        await update.message.reply_text("Выберите класс кнопкой.", reply_markup=cars_kb())
         return DRV_CLASS
-    context.user_data["driver"]["car_class"] = car_class
+
+    context.user_data["driver"]["car_class"] = text
     await update.message.reply_text(
-        "Укажите номер авто (например: A777AA77):",
+        "Введите номер авто (например: A777AA77):",
         reply_markup=ReplyKeyboardMarkup([["❌ Отмена"]], resize_keyboard=True),
     )
     return DRV_PLATE
 
 
 async def setdriver_plate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["driver"]["plate"] = update.message.text.strip()
+    text = update.message.text.strip()
+
+    if text in ("❌ Отмена", "Отмена"):
+        return await cancel_cmd(update, context)
+
+    context.user_data["driver"]["plate"] = text
+
     await update.message.reply_text(
-        "Отправьте <b>1–3 фото вашей машины</b> (можно по очереди).\n"
-        "После последнего фото напишите «Готово».",
+        "Отправьте 1–3 фото вашей машины.\nПосле отправки всех фото нажмите «Готово».",
         reply_markup=ReplyKeyboardMarkup([["Готово", "❌ Отмена"]], resize_keyboard=True),
-        parse_mode=ParseMode.HTML,
     )
     return DRV_PHOTO
 
 
 async def finish_driver_registration(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     d = context.user_data["driver"]
-    photos: List[str] = d.get("photos") or []
+    photos = d["photos"]
+
     if not photos:
-        await update.message.reply_text("Сначала отправьте хотя бы одно фото машины.")
+        await update.message.reply_text("Отправьте хотя бы одно фото.")
         return DRV_PHOTO
 
     upsert_driver(
@@ -564,11 +575,10 @@ async def finish_driver_registration(update: Update, context: ContextTypes.DEFAU
     )
 
     await update.message.reply_text(
-        "Данные водителя сохранены.\n"
+        "Регистрация завершена.\n"
         f"Класс: {d['car_class']}\n"
-        f"Номер авто: {d['plate']}\n"
-        f"Фото: {len(photos)} шт.\n"
-        "Теперь вы сможете брать заказы только по своему классу.",
+        f"Номер: {d['plate']}\n"
+        f"Фото: {len(photos)} шт.",
         reply_markup=main_menu_kb(),
     )
     context.user_data.pop("driver", None)
@@ -576,36 +586,33 @@ async def finish_driver_registration(update: Update, context: ContextTypes.DEFAU
 
 
 async def setdriver_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    d = context.user_data.get("driver") or {}
-    photos: List[str] = d.setdefault("photos", [])
+    d = context.user_data["driver"]
 
     # Фото
     if update.message.photo:
-        photo = update.message.photo[-1]
-        file_id = photo.file_id
-        if file_id not in photos:
-            photos.append(file_id)
+        fid = update.message.photo[-1].file_id
+        d["photos"].append(fid)
 
-        if len(photos) < 3:
-            await update.message.reply_text(
-                f"Фото сохранено ({len(photos)}/3).\n"
-                "Можете отправить ещё фото или написать «Готово».",
-            )
-            return DRV_PHOTO
-        # уже 3 фото — завершаем
-        return await finish_driver_registration(update, context)
+        if len(d["photos"]) >= 3:
+            return await finish_driver_registration(update, context)
+
+        await update.message.reply_text(
+            f"Фото сохранено ({len(d['photos'])}/3).",
+        )
+        return DRV_PHOTO
 
     # Текст
-    text = (update.message.text or "").lower().strip()
+    text = update.message.text.lower().strip()
+
+    if text in ("❌ отмена", "отмена"):
+        return await cancel_cmd(update, context)
+
     if text.startswith("готов"):
         return await finish_driver_registration(update, context)
 
-    await update.message.reply_text(
-        "Отправьте фото машины или напишите «Готово», когда закончите."
-    )
+    await update.message.reply_text("Отправьте фото или нажмите «Готово».")
     return DRV_PHOTO
-
-
+    
 # ---------- ЗАКАЗ (обычный) ----------
 
 async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
