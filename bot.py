@@ -1288,7 +1288,7 @@ def build_app() -> Application:
         MessageHandler(filters.Regex("^❌ Отмена$"), cancel_cmd),
     ],
     allow_reentry=True,
-)
+) 
 
     # заказ (обычный + срочный)
     order_conv = ConversationHandler(
