@@ -612,7 +612,7 @@ async def setdriver_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     await update.message.reply_text("Отправьте фото или нажмите «Готово».")
     return DRV_PHOTO
-    
+ 
 # ---------- ЗАКАЗ (обычный) ----------
 
 async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
